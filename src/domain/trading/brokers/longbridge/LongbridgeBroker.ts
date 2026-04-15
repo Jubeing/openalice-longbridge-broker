@@ -276,7 +276,7 @@ export class LongbridgeBroker implements IBroker {
     const details = new ContractDetails()
     details.contract = entry ? makeContract(entry.lbSymbol) : makeContract(lbSymbol)
     if (entry) {
-      details.contract.stockName  = entry.stockName
+      details.contract.description = entry.stockName
       details.validExchanges     = entry.exchange
       details.orderTypes         = 'MKT,LMT,STP,LIT,MIT,TSMAMT,TSLPPCT'
       details.stockType          = 'COMMON'
@@ -525,8 +525,8 @@ export class LongbridgeBroker implements IBroker {
           // TradingSessionInfo.beginTime / endTime are NAPI-RS Time objects
           // Time has .toString() returning "HH:mm:ss" — reconstruct as today's datetime
           const today = new Date().toISOString().split('T')[0]
-          const beginMs = new Date(`${today}T${s.beginTime.toString()}`).getTime()
-          const endMs   = new Date(`${today}T${s.endTime.toString()}`).getTime()
+          const beginMs = new Date(`${today}T${s.beginTime}`).getTime()
+          const endMs   = new Date(`${today}T${s.endTime}`).getTime()
           if (nowMs >= beginMs && nowMs <= endMs) {
             // 0 = Intraday = main session = market open
             return { isOpen: s.tradeSession === 0, timestamp: new Date() }
