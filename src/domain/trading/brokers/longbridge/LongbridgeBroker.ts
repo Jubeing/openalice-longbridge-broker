@@ -494,12 +494,16 @@ export class LongbridgeBroker implements IBroker {
       const q = quotes[0]
       if (!q) throw new BrokerError('EXCHANGE', `No quote for ${lbSymbol}`)
 
+      // Build contract with Chinese name (e.g. "腾讯控股 700.HK")
+      const contract = makeContract(lbSymbol)
+      contract.description = q.name ?? ''
+
       // SecurityDepth.bids/asks — each element has .price (Decimal) and .volume
       const bids = depthData.bids ?? []
       const asks = depthData.asks ?? []
 
       return {
-        contract:  makeContract(lbSymbol),
+        contract,
         last:      lbToNumber(q.lastDone),
         bid:       bids[0]?.price ? lbToNumber(bids[0].price) : 0,
         ask:       asks[0]?.price ? lbToNumber(asks[0].price) : 0,
@@ -563,6 +567,9 @@ export class LongbridgeBroker implements IBroker {
 
   private mapStockPosition(pos: StockPosition, livePrices: Map<string, number>): Position {
     const contract = makeContract(pos.symbol)
+    // Inject Chinese stock name so it displays as "腾讯控股 700.HK" instead of just "700.HK"
+    contract.description = (pos as Record<string, unknown>).stockName as string | undefined
+      ?? contract.description ?? ''
     const qty     = new Decimal(lbToString(pos.quantity))
     const cost    = new Decimal(lbToString(pos.costPrice))
     // Use live quote price if available; otherwise fall back to costPrice
@@ -583,6 +590,9 @@ export class LongbridgeBroker implements IBroker {
 
   private mapOpenOrder(o: import('longbridge').OrderDetail): OpenOrder {
     const contract = makeContract(o.symbol)
+    // Inject Chinese stock name so it displays as "腾讯控股 700.HK" instead of just "700.HK"
+    contract.description = (o as Record<string, unknown>).stockName as string | undefined
+      ?? contract.description ?? ''
 
     const order = new Order()
     order.action         = o.side === LbOrderSide.Buy ? 'BUY' : 'SELL'
