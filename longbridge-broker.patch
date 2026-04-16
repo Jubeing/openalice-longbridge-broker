@@ -10,24 +10,12 @@ index c590852..af33134 100644
      "express": "^5.2.1",
      "file-type": "^21.3.2",
      "grammy": "^1.40.0",
-diff --git a/src/domain/trading/brokers/index.ts b/src/domain/trading/brokers/index.ts
-index dfb210d..7665fd0 100644
---- a/src/domain/trading/brokers/index.ts
-+++ b/src/domain/trading/brokers/index.ts
-@@ -29,3 +29,7 @@ export type { CcxtBrokerConfig } from './ccxt/index.js'
- // IBKR
- export { IbkrBroker } from './ibkr/index.js'
- export type { IbkrBrokerConfig } from './ibkr/index.js'
-+
-+// Longbridge
-+export { LongbridgeBroker } from './longbridge/index.js'
-+export type { LongbridgeBrokerConfig } from './longbridge/index.js'
 diff --git a/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts b/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts
 new file mode 100644
-index 0000000..82a42f1
+index 0000000..ee51d3f
 --- /dev/null
 +++ b/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts
-@@ -0,0 +1,605 @@
+@@ -0,0 +1,628 @@
 +/**
 + * LongbridgeBroker — IBroker adapter for Longbridge (长桥证券)
 + *
@@ -470,22 +458,29 @@ index 0000000..82a42f1
 +        }
 +      }
 +
-+      // Fetch live quotes for all positions in one API call
++      // Fetch live quotes and Chinese names in parallel
 +      let livePrices: Map<string, number> = new Map()
++      let cnNames: Map<string, string> = new Map()
 +      if (symbols.length > 0) {
 +        try {
-+          const quotes = await this.quoteCtx.quote(symbols)
++          const [quotes, staticInfos] = await Promise.all([
++            this.quoteCtx.quote(symbols),
++            this.quoteCtx.staticInfo(symbols),
++          ])
 +          for (const q of quotes) {
 +            if (q) livePrices.set(q.symbol, lbToNumber(q.lastDone))
 +          }
++          for (const info of staticInfos) {
++            if (info && info.nameCn) cnNames.set(info.symbol, info.nameCn)
++          }
 +        } catch {
-+          // If quote fails, livePrices stays empty — will use costPrice as fallback
++          // If quote/staticInfo fails, fallbacks apply
 +        }
 +      }
 +
 +      for (const channel of channels) {
 +        for (const pos of channel.positions ?? []) {
-+          positions.push(this.mapStockPosition(pos, livePrices))
++          positions.push(this.mapStockPosition(pos, livePrices, cnNames))
 +        }
 +      }
 +      return positions
@@ -591,14 +586,30 @@ index 0000000..82a42f1
 +
 +  // ---- Internal ----
 +
-+  private mapStockPosition(pos: StockPosition, livePrices: Map<string, number>): Position {
++  /** Detect if a Longbridge symbol is a US equity option (e.g. AAPL250517C00150000.US) */
++  private isOption(symbol: string): boolean {
++    return /^([A-Z]{1,5})(\d{6})([CP])(\d+)\.(US|HK)$/.test(symbol.toUpperCase())
++  }
++
++  private mapStockPosition(pos: StockPosition, livePrices: Map<string, number>, cnNames?: Map<string, string>): Position {
 +    const contract = makeContract(pos.symbol)
-+    contract.description = pos.symbolName ?? pos.symbol
-+    const qty     = new Decimal(lbToString(pos.quantity))
-+    const cost    = new Decimal(lbToString(pos.costPrice))
-+    // Use live quote price if available; otherwise fall back to costPrice
-+    const livePrice = livePrices.get(pos.symbol)
-+    const mktPrice  = livePrice !== undefined ? new Decimal(livePrice) : cost
++    // Priority: Longbridge API nameCn (latest) > registry Chinese name > symbolName (English) > symbol
++    const apiCnName = cnNames?.get(pos.symbol)
++    if (apiCnName) {
++      // Use API Chinese name — append code in brackets
++      contract.description = `${apiCnName}（${contract.symbol}）`
++    } else if (!contract.description) {
++      // Fallback to registry or English name
++      contract.description = pos.symbolName ?? pos.symbol
++    }
++    const qty          = new Decimal(lbToString(pos.quantity))
++    const cost         = new Decimal(lbToString(pos.costPrice))
++    const livePrice    = livePrices.get(pos.symbol)
++    const mktPrice     = livePrice !== undefined ? new Decimal(livePrice) : cost
++    // Options use contract multiplier of 100 (each contract = 100 shares)
++    const isOpt        = this.isOption(pos.symbol)
++    const multiplier   = isOpt ? new Decimal(100) : new Decimal(1)
++
 +    return {
 +      contract,
 +      currency:     pos.currency ?? 'HKD',
@@ -606,8 +617,8 @@ index 0000000..82a42f1
 +      quantity:     qty,
 +      avgCost:      lbToString(pos.costPrice),
 +      marketPrice:  mktPrice.toString(),
-+      marketValue:  qty.mul(mktPrice).abs().toString(),
-+      unrealizedPnL: mktPrice.sub(cost).mul(qty).toString(),
++      marketValue:  qty.mul(mktPrice).mul(multiplier).abs().toString(),
++      unrealizedPnL: mktPrice.sub(cost).mul(qty).mul(multiplier).toString(),
 +      realizedPnL:  '0',
 +    }
 +  }
@@ -657,10 +668,10 @@ index 0000000..4fae0d8
 +} from './longbridge-contracts.js'
 diff --git a/src/domain/trading/brokers/longbridge/longbridge-contracts.ts b/src/domain/trading/brokers/longbridge/longbridge-contracts.ts
 new file mode 100644
-index 0000000..af0c990
+index 0000000..9de4f35
 --- /dev/null
 +++ b/src/domain/trading/brokers/longbridge/longbridge-contracts.ts
-@@ -0,0 +1,269 @@
+@@ -0,0 +1,279 @@
 +/**
 + * Contract mapping between Longbridge and OpenAlice (IBKR-style).
 + *
@@ -770,6 +781,15 @@ index 0000000..af0c990
 +  c.exchange = parsed.exchange
 +  c.secType = parsed.secType
 +  c.currency = parsed.currency
++
++  // Set display description: "中文名（代码）"
++  const entry = STATIC_CONTRACT_REGISTRY.find(
++    e => e.lbSymbol.toUpperCase() === lbSymbol.toUpperCase(),
++  )
++  if (entry) {
++    c.description = `${entry.stockNameCn}（${entry.symbol}）`
++  }
++
 +  return c
 +}
 +
@@ -836,99 +856,100 @@ index 0000000..af0c990
 +  exchange: string
 +  currency: string
 +  stockName: string
++  stockNameCn: string
 +}> = [
 +  // ---- Hong Kong ----
-+  { symbol: '700',   lbSymbol: '700.HK',   secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Tencent Holdings' },
-+  { symbol: '9988', lbSymbol: '9988.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Alibaba Group' },
-+  { symbol: '3690', lbSymbol: '3690.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Meituan' },
-+  { symbol: '9618', lbSymbol: '9618.HK',   secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'JD.com' },
-+  { symbol: '1810', lbSymbol: '1810.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Xiaomi Corporation' },
-+  { symbol: '0941', lbSymbol: '0941.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Mobile' },
-+  { symbol: '2628', lbSymbol: '2628.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Life Insurance' },
-+  { symbol: '1398', lbSymbol: '1398.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'ICBC' },
-+  { symbol: '3968', lbSymbol: '3968.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Merchants Bank' },
-+  { symbol: '3868', lbSymbol: '3868.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Overseas Water' },
-+  { symbol: '1088', lbSymbol: '1088.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Shenhua Energy' },
-+  { symbol: '6633', lbSymbol: '6633.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Telecom' },
-+  { symbol: '1211', lbSymbol: '1211.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'BYD' },
-+  { symbol: '2319', lbSymbol: '2319.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Mengniu Dairy' },
-+  { symbol: '0011', lbSymbol: '0011.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'HSBC Holdings' },
-+  { symbol: '2388', lbSymbol: '2388.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Hang Seng Bank' },
-+  { symbol: '0001', lbSymbol: '0001.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'CKH Holdings' },
-+  { symbol: '0016', lbSymbol: '0016.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Sun Hung Kai Properties' },
-+  { symbol: '0012', lbSymbol: '0012.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Henderson Land' },
-+  { symbol: '6060', lbSymbol: '6060.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'ZhongAn Online' },
-+  { symbol: '6030', lbSymbol: '6030.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Citic Securities' },
-+  { symbol: '6837', lbSymbol: '6837.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Huaan Securities' },
-+  { symbol: '3888', lbSymbol: '3888.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China International Capital' },
-+  { symbol: '1772', lbSymbol: '1772.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Jiangsu Hengrui Medicine' },
-+  { symbol: '1515', lbSymbol: '1515.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'CSPC Pharma' },
++  { symbol: '700',   lbSymbol: '700.HK',   secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Tencent Holdings',         stockNameCn: '腾讯控股' },
++  { symbol: '9988', lbSymbol: '9988.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Alibaba Group',         stockNameCn: '阿里巴巴' },
++  { symbol: '3690', lbSymbol: '3690.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Meituan',               stockNameCn: '美团' },
++  { symbol: '9618', lbSymbol: '9618.HK',   secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'JD.com',                stockNameCn: '京东集团' },
++  { symbol: '1810', lbSymbol: '1810.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Xiaomi Corporation',   stockNameCn: '小米集团' },
++  { symbol: '0941', lbSymbol: '0941.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Mobile',         stockNameCn: '中国移动' },
++  { symbol: '2628', lbSymbol: '2628.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Life Insurance', stockNameCn: '中国人寿' },
++  { symbol: '1398', lbSymbol: '1398.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'ICBC',                  stockNameCn: '工商银行' },
++  { symbol: '3968', lbSymbol: '3968.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Merchants Bank', stockNameCn: '招商银行' },
++  { symbol: '3868', lbSymbol: '3868.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Overseas Water', stockNameCn: '中国海外发展' },
++  { symbol: '1088', lbSymbol: '1088.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Shenhua Energy', stockNameCn: '中国神华' },
++  { symbol: '6633', lbSymbol: '6633.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Telecom',         stockNameCn: '中国电信' },
++  { symbol: '1211', lbSymbol: '1211.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'BYD',                  stockNameCn: '比亚迪' },
++  { symbol: '2319', lbSymbol: '2319.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Mengniu Dairy',      stockNameCn: '蒙牛乳业' },
++  { symbol: '0011', lbSymbol: '0011.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'HSBC Holdings',       stockNameCn: '汇丰控股' },
++  { symbol: '2388', lbSymbol: '2388.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Hang Seng Bank',      stockNameCn: '恒生银行' },
++  { symbol: '0001', lbSymbol: '0001.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'CKH Holdings',        stockNameCn: '长和实业' },
++  { symbol: '0016', lbSymbol: '0016.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Sun Hung Kai Properties', stockNameCn: '新鸿基地产' },
++  { symbol: '0012', lbSymbol: '0012.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Henderson Land',      stockNameCn: '恒基兆业' },
++  { symbol: '6060', lbSymbol: '6060.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'ZhongAn Online',      stockNameCn: '众安在线' },
++  { symbol: '6030', lbSymbol: '6030.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Citic Securities',    stockNameCn: '中信证券' },
++  { symbol: '6837', lbSymbol: '6837.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Huaan Securities',    stockNameCn: '华安证券' },
++  { symbol: '3888', lbSymbol: '3888.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China International Capital', stockNameCn: '中金公司' },
++  { symbol: '1772', lbSymbol: '1772.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Jiangsu Hengrui Medicine', stockNameCn: '恒瑞医药' },
++  { symbol: '1515', lbSymbol: '1515.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'CSPC Pharma',          stockNameCn: '石药集团' },
 +
 +  // ---- US ----
-+  { symbol: 'AAPL',  lbSymbol: 'AAPL.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Apple Inc.' },
-+  { symbol: 'MSFT',  lbSymbol: 'MSFT.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Microsoft Corporation' },
-+  { symbol: 'NVDA',  lbSymbol: 'NVDA.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'NVIDIA Corporation' },
-+  { symbol: 'GOOGL', lbSymbol: 'GOOGL.US', secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Alphabet Inc. Class A' },
-+  { symbol: 'GOOG',  lbSymbol: 'GOOG.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Alphabet Inc. Class C' },
-+  { symbol: 'AMZN',  lbSymbol: 'AMZN.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Amazon.com Inc.' },
-+  { symbol: 'META',  lbSymbol: 'META.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Meta Platforms' },
-+  { symbol: 'TSLA',  lbSymbol: 'TSLA.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Tesla Inc.' },
-+  { symbol: 'BRK.B', lbSymbol: 'BRK.B.US', secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Berkshire Hathaway B' },
-+  { symbol: 'JPM',   lbSymbol: 'JPM.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'JPMorgan Chase & Co.' },
-+  { symbol: 'V',     lbSymbol: 'V.US',     secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Visa Inc.' },
-+  { symbol: 'MA',    lbSymbol: 'MA.US',    secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Mastercard Inc.' },
-+  { symbol: 'JNJ',   lbSymbol: 'JNJ.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Johnson & Johnson' },
-+  { symbol: 'WMT',   lbSymbol: 'WMT.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Walmart Inc.' },
-+  { symbol: 'PG',    lbSymbol: 'PG.US',    secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Procter & Gamble' },
-+  { symbol: 'UNH',   lbSymbol: 'UNH.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'UnitedHealth Group' },
-+  { symbol: 'HD',   lbSymbol: 'HD.US',    secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Home Depot' },
-+  { symbol: 'BAC',   lbSymbol: 'BAC.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Bank of America' },
-+  { symbol: 'XOM',   lbSymbol: 'XOM.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Exxon Mobil' },
-+  { symbol: 'DIS',   lbSymbol: 'DIS.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Walt Disney' },
-+  { symbol: 'NFLX',  lbSymbol: 'NFLX.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Netflix Inc.' },
-+  { symbol: 'INTC',  lbSymbol: 'INTC.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Intel Corporation' },
-+  { symbol: 'AMD',   lbSymbol: 'AMD.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Advanced Micro Devices' },
-+  { symbol: 'PYPL',  lbSymbol: 'PYPL.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'PayPal Holdings' },
-+  { symbol: 'CRM',   lbSymbol: 'CRM.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Salesforce Inc.' },
-+  { symbol: 'UBER',  lbSymbol: 'UBER.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Uber Technologies' },
-+  { symbol: 'COIN',  lbSymbol: 'COIN.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Coinbase Global' },
-+  { symbol: 'SQ',    lbSymbol: 'SQ.US',    secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Block Inc.' },
-+  { symbol: 'SHOP',  lbSymbol: 'SHOP.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Shopify Inc.' },
-+  { symbol: 'SPXL',  lbSymbol: 'SPXL.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Direxion Daily S&P500 3x' },
++  { symbol: 'AAPL',  lbSymbol: 'AAPL.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Apple Inc.',             stockNameCn: '苹果' },
++  { symbol: 'MSFT',  lbSymbol: 'MSFT.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Microsoft Corporation', stockNameCn: '微软' },
++  { symbol: 'NVDA',  lbSymbol: 'NVDA.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'NVIDIA Corporation',  stockNameCn: '英伟达' },
++  { symbol: 'GOOGL', lbSymbol: 'GOOGL.US', secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Alphabet Inc. Class A', stockNameCn: '谷歌A' },
++  { symbol: 'GOOG',  lbSymbol: 'GOOG.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Alphabet Inc. Class C', stockNameCn: '谷歌C' },
++  { symbol: 'AMZN',  lbSymbol: 'AMZN.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Amazon.com Inc.',     stockNameCn: '亚马逊' },
++  { symbol: 'META',  lbSymbol: 'META.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Meta Platforms',      stockNameCn: 'Meta' },
++  { symbol: 'TSLA',  lbSymbol: 'TSLA.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Tesla Inc.',          stockNameCn: '特斯拉' },
++  { symbol: 'BRK.B', lbSymbol: 'BRK.B.US', secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Berkshire Hathaway B', stockNameCn: '伯克希尔B' },
++  { symbol: 'JPM',   lbSymbol: 'JPM.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'JPMorgan Chase & Co.', stockNameCn: '摩根大通' },
++  { symbol: 'V',     lbSymbol: 'V.US',     secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Visa Inc.',          stockNameCn: 'Visa' },
++  { symbol: 'MA',    lbSymbol: 'MA.US',    secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Mastercard Inc.',     stockNameCn: '万事达' },
++  { symbol: 'JNJ',   lbSymbol: 'JNJ.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Johnson & Johnson',   stockNameCn: '强生' },
++  { symbol: 'WMT',   lbSymbol: 'WMT.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Walmart Inc.',        stockNameCn: '沃尔玛' },
++  { symbol: 'PG',    lbSymbol: 'PG.US',    secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Procter & Gamble',   stockNameCn: '宝洁' },
++  { symbol: 'UNH',   lbSymbol: 'UNH.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'UnitedHealth Group',  stockNameCn: '联合健康' },
++  { symbol: 'HD',    lbSymbol: 'HD.US',    secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Home Depot',          stockNameCn: '家得宝' },
++  { symbol: 'BAC',   lbSymbol: 'BAC.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Bank of America',    stockNameCn: '美国银行' },
++  { symbol: 'XOM',   lbSymbol: 'XOM.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Exxon Mobil',        stockNameCn: '埃克森美孚' },
++  { symbol: 'DIS',   lbSymbol: 'DIS.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Walt Disney',        stockNameCn: '迪士尼' },
++  { symbol: 'NFLX',  lbSymbol: 'NFLX.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Netflix Inc.',       stockNameCn: '奈飞' },
++  { symbol: 'INTC',  lbSymbol: 'INTC.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Intel Corporation',  stockNameCn: '英特尔' },
++  { symbol: 'AMD',   lbSymbol: 'AMD.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Advanced Micro Devices', stockNameCn: '超微半导体' },
++  { symbol: 'PYPL',  lbSymbol: 'PYPL.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'PayPal Holdings',    stockNameCn: 'PayPal' },
++  { symbol: 'CRM',   lbSymbol: 'CRM.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Salesforce Inc.',    stockNameCn: 'Salesforce' },
++  { symbol: 'UBER',  lbSymbol: 'UBER.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Uber Technologies',   stockNameCn: 'Uber' },
++  { symbol: 'COIN',  lbSymbol: 'COIN.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Coinbase Global',     stockNameCn: 'Coinbase' },
++  { symbol: 'SQ',    lbSymbol: 'SQ.US',    secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Block Inc.',         stockNameCn: 'Block' },
++  { symbol: 'SHOP',  lbSymbol: 'SHOP.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Shopify Inc.',       stockNameCn: 'Shopify' },
++  { symbol: 'SPXL',  lbSymbol: 'SPXL.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Direxion Daily S&P500 3x', stockNameCn: '3倍做多S&P500' },
 +
 +  // ---- Shanghai Stock Connect ----
-+  { symbol: '600000', lbSymbol: 'SH.600000', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Shanghai Pudong Dev Bank' },
-+  { symbol: '600519', lbSymbol: 'SH.600519', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Kweichow Moutai' },
-+  { symbol: '600036', lbSymbol: 'SH.600036', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'China Merchants Bank' },
-+  { symbol: '601012', lbSymbol: 'SH.601012', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: '隆基绿能 LONGi Green Energy' },
-+  { symbol: '601318', lbSymbol: 'SH.601318', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Ping An Insurance' },
-+  { symbol: '601398', lbSymbol: 'SH.601398', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Industrial and Commercial Bank of China' },
-+  { symbol: '600276', lbSymbol: 'SH.600276', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Jiangsu Hengrui Medicine' },
-+  { symbol: '600030', lbSymbol: 'SH.600030', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Citic Securities' },
-+  { symbol: '600887', lbSymbol: 'SH.600887', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Inner Mongolia Yili' },
-+  { symbol: '600009', lbSymbol: 'SH.600009', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Shanghai International Airport' },
++  { symbol: '600000', lbSymbol: 'SH.600000', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Shanghai Pudong Dev Bank', stockNameCn: '浦发银行' },
++  { symbol: '600519', lbSymbol: 'SH.600519', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Kweichow Moutai',     stockNameCn: '贵州茅台' },
++  { symbol: '600036', lbSymbol: 'SH.600036', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'China Merchants Bank', stockNameCn: '招商银行' },
++  { symbol: '601012', lbSymbol: 'SH.601012', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: '隆基绿能 LONGi Green Energy', stockNameCn: '隆基绿能' },
++  { symbol: '601318', lbSymbol: 'SH.601318', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Ping An Insurance',    stockNameCn: '中国平安' },
++  { symbol: '601398', lbSymbol: 'SH.601398', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Industrial and Commercial Bank of China', stockNameCn: '工商银行' },
++  { symbol: '600276', lbSymbol: 'SH.600276', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Jiangsu Hengrui Medicine', stockNameCn: '恒瑞医药' },
++  { symbol: '600030', lbSymbol: 'SH.600030', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Citic Securities',    stockNameCn: '中信证券' },
++  { symbol: '600887', lbSymbol: 'SH.600887', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Inner Mongolia Yili', stockNameCn: '伊利股份' },
++  { symbol: '600009', lbSymbol: 'SH.600009', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Shanghai International Airport', stockNameCn: '上海机场' },
 +
 +  // ---- Shenzhen Stock Connect ----
-+  { symbol: '000001', lbSymbol: 'SZ.000001', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'Ping An Bank' },
-+  { symbol: '000002', lbSymbol: 'SZ.000002', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'China Vanke' },
-+  { symbol: '000063', lbSymbol: 'SZ.000063', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'ZTE Corporation' },
-+  { symbol: '000333', lbSymbol: 'SZ.000333', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'Midea Group' },
-+  { symbol: '000858', lbSymbol: 'SZ.000858', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'Wuliangye Yibin' },
-+  { symbol: '000876', lbSymbol: 'SZ.000876', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'New Hope Liuhe' },
-+  { symbol: '002594', lbSymbol: 'SZ.002594', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'BYD' },
-+  { symbol: '002415', lbSymbol: 'SZ.002415', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'Hikvision' },
-+  { symbol: '002475', lbSymbol: 'SZ.002475', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'Luxshare Precision' },
-+  { symbol: '300750', lbSymbol: 'SZ.300750', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'CATL (Contemporary Amperex Technology)' },
++  { symbol: '000001', lbSymbol: 'SZ.000001', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'Ping An Bank',         stockNameCn: '平安银行' },
++  { symbol: '000002', lbSymbol: 'SZ.000002', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'China Vanke',        stockNameCn: '万科A' },
++  { symbol: '000063', lbSymbol: 'SZ.000063', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'ZTE Corporation',    stockNameCn: '中兴通讯' },
++  { symbol: '000333', lbSymbol: 'SZ.000333', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'Midea Group',         stockNameCn: '美的集团' },
++  { symbol: '000858', lbSymbol: 'SZ.000858', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'Wuliangye Yibin',    stockNameCn: '五粮液' },
++  { symbol: '000876', lbSymbol: 'SZ.000876', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'New Hope Liuhe',     stockNameCn: '新希望' },
++  { symbol: '002594', lbSymbol: 'SZ.002594', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'BYD',                 stockNameCn: '比亚迪' },
++  { symbol: '002415', lbSymbol: 'SZ.002415', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'Hikvision',          stockNameCn: '海康威视' },
++  { symbol: '002475', lbSymbol: 'SZ.002475', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'Luxshare Precision', stockNameCn: '立讯精密' },
++  { symbol: '300750', lbSymbol: 'SZ.300750', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'CATL (Contemporary Amperex Technology)', stockNameCn: '宁德时代' },
 +
 +  // ---- Singapore ----
-+  { symbol: 'STI',    lbSymbol: 'STI.SG',    secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'Straits Times Index ETF' },
-+  { symbol: 'D05',   lbSymbol: 'D05.SG',   secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'DBS Group Holdings' },
-+  { symbol: 'O39',   lbSymbol: 'O39.SG',   secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'OCBC Bank' },
-+  { symbol: 'U11',   lbSymbol: 'U11.SG',   secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'United Overseas Bank' },
-+  { symbol: 'C6L',   lbSymbol: 'C6L.SG',   secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'Singapore Airlines' },
-+  { symbol: 'Z74',   lbSymbol: 'Z74.SG',   secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'SATS Ltd' },
-+  { symbol: 'ME8U',  lbSymbol: 'ME8U.SG',  secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'Mapletree Pan Asia Commercial Trust' },
-+  { symbol: 'BUOU',  lbSymbol: 'BUOU.SG',  secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'Mapletree Oakwood REIT' },
++  { symbol: 'STI',    lbSymbol: 'STI.SG',    secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'Straits Times Index ETF', stockNameCn: '海峡时报指数' },
++  { symbol: 'D05',   lbSymbol: 'D05.SG',   secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'DBS Group Holdings', stockNameCn: '星展集团' },
++  { symbol: 'O39',   lbSymbol: 'O39.SG',   secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'OCBC Bank',           stockNameCn: '华侨银行' },
++  { symbol: 'U11',   lbSymbol: 'U11.SG',   secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'United Overseas Bank', stockNameCn: '大华银行' },
++  { symbol: 'C6L',   lbSymbol: 'C6L.SG',   secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'Singapore Airlines',  stockNameCn: '新加坡航空' },
++  { symbol: 'Z74',   lbSymbol: 'Z74.SG',   secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'SATS Ltd',            stockNameCn: 'SATS' },
++  { symbol: 'ME8U',  lbSymbol: 'ME8U.SG',  secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'Mapletree Pan Asia Commercial Trust', stockNameCn: '凯德商用房产信托' },
++  { symbol: 'BUOU',  lbSymbol: 'BUOU.SG',  secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'Mapletree Oakwood REIT', stockNameCn: '凯德乌节路信托' },
 +]
 diff --git a/src/domain/trading/brokers/longbridge/longbridge-types.ts b/src/domain/trading/brokers/longbridge/longbridge-types.ts
 new file mode 100644
@@ -1141,43 +1162,3 @@ index 0000000..9c766df
 +  /** Enable live trading (default: false = paper/test) */
 +  live?: boolean
 +}
-diff --git a/src/domain/trading/brokers/registry.ts b/src/domain/trading/brokers/registry.ts
-index b640ea2..d0b8826 100644
---- a/src/domain/trading/brokers/registry.ts
-+++ b/src/domain/trading/brokers/registry.ts
-@@ -11,6 +11,7 @@ import type { AccountConfig } from '../../../core/config.js'
- import { CcxtBroker } from './ccxt/CcxtBroker.js'
- import { AlpacaBroker } from './alpaca/AlpacaBroker.js'
- import { IbkrBroker } from './ibkr/IbkrBroker.js'
-+import { LongbridgeBroker } from './longbridge/index.js'
- 
- // ==================== Subtitle field descriptor ====================
- 
-@@ -113,4 +114,27 @@ Before connecting:
- 
- Paper trading requires a separate paper account login in TWS.`,
-   },
-+  longbridge: {
-+    configSchema: LongbridgeBroker.configSchema,
-+    configFields: LongbridgeBroker.configFields,
-+    fromConfig: LongbridgeBroker.fromConfig,
-+    name: 'Longbridge (长桥证券)',
-+    description: 'Commission-free trading for HK, US, Shanghai A, Shenzhen A, and Singapore equities. No local terminal required.',
-+    badge: 'LB',
-+    badgeColor: 'text-blue-400',
-+    subtitleFields: [
-+      { field: 'live', label: 'Live Trading', falseLabel: 'Paper/Test' },
-+    ],
-+    guardCategory: 'securities',
-+    setupGuide: `Longbridge (长桥证券) is a global brokerage offering commission-free trading across Hong Kong, US, Shanghai/Shenzhen A-shares (via Stock Connect), and Singapore markets.
-+
-+Before connecting:
-+1. Open an account at app.longbridge.global and complete identity verification
-+2. Create an API application in Settings → API → Create App — you will receive an App Key, App Secret, and Access Token
-+3. Grant trading permissions to the API key (read + trade, no withdrawal)
-+
-+The Access Token is a long-lived OAuth bearer token. Treat it like a password — never commit it to source control.
-+
-+You can toggle "Live Trading" to route orders to the live or test environment. Use the test environment to validate your setup before placing real orders.`,
-+  },
- }
