@@ -10,6 +10,18 @@ index c590852..af33134 100644
      "express": "^5.2.1",
      "file-type": "^21.3.2",
      "grammy": "^1.40.0",
+diff --git a/src/domain/trading/brokers/index.ts b/src/domain/trading/brokers/index.ts
+index dfb210d..7665fd0 100644
+--- a/src/domain/trading/brokers/index.ts
++++ b/src/domain/trading/brokers/index.ts
+@@ -29,3 +29,7 @@ export type { CcxtBrokerConfig } from './ccxt/index.js'
+ // IBKR
+ export { IbkrBroker } from './ibkr/index.js'
+ export type { IbkrBrokerConfig } from './ibkr/index.js'
++
++// Longbridge
++export { LongbridgeBroker } from './longbridge/index.js'
++export type { LongbridgeBrokerConfig } from './longbridge/index.js'
 diff --git a/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts b/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts
 new file mode 100644
 index 0000000..d61e94a
@@ -1187,3 +1199,70 @@ index 0000000..9c766df
 +  /** Enable live trading (default: false = paper/test) */
 +  live?: boolean
 +}
+diff --git a/src/domain/trading/brokers/registry.ts b/src/domain/trading/brokers/registry.ts
+index b640ea2..d0b8826 100644
+--- a/src/domain/trading/brokers/registry.ts
++++ b/src/domain/trading/brokers/registry.ts
+@@ -11,6 +11,7 @@ import type { AccountConfig } from '../../../core/config.js'
+ import { CcxtBroker } from './ccxt/CcxtBroker.js'
+ import { AlpacaBroker } from './alpaca/AlpacaBroker.js'
+ import { IbkrBroker } from './ibkr/IbkrBroker.js'
++import { LongbridgeBroker } from './longbridge/index.js'
+ 
+ // ==================== Subtitle field descriptor ====================
+ 
+@@ -113,4 +114,27 @@ Before connecting:
+ 
+ Paper trading requires a separate paper account login in TWS.`,
+   },
++  longbridge: {
++    configSchema: LongbridgeBroker.configSchema,
++    configFields: LongbridgeBroker.configFields,
++    fromConfig: LongbridgeBroker.fromConfig,
++    name: 'Longbridge (长桥证券)',
++    description: 'Commission-free trading for HK, US, Shanghai A, Shenzhen A, and Singapore equities. No local terminal required.',
++    badge: 'LB',
++    badgeColor: 'text-blue-400',
++    subtitleFields: [
++      { field: 'live', label: 'Live Trading', falseLabel: 'Paper/Test' },
++    ],
++    guardCategory: 'securities',
++    setupGuide: `Longbridge (长桥证券) is a global brokerage offering commission-free trading across Hong Kong, US, Shanghai/Shenzhen A-shares (via Stock Connect), and Singapore markets.
++
++Before connecting:
++1. Open an account at app.longbridge.global and complete identity verification
++2. Create an API application in Settings → API → Create App — you will receive an App Key, App Secret, and Access Token
++3. Grant trading permissions to the API key (read + trade, no withdrawal)
++
++The Access Token is a long-lived OAuth bearer token. Treat it like a password — never commit it to source control.
++
++You can toggle "Live Trading" to route orders to the live or test environment. Use the test environment to validate your setup before placing real orders.`,
++  },
+ }
+diff --git a/ui/src/api/types.ts b/ui/src/api/types.ts
+index 61f7fa2..927361a 100644
+--- a/ui/src/api/types.ts
++++ b/ui/src/api/types.ts
+@@ -241,6 +241,7 @@ export interface Position {
+     right?: string
+     multiplier?: number
+     localSymbol?: string
++    description?: string
+   }
+   /** Currency denomination of all monetary fields. */
+   currency: string
+diff --git a/ui/src/pages/PortfolioPage.tsx b/ui/src/pages/PortfolioPage.tsx
+index f86671f..daf694d 100644
+--- a/ui/src/pages/PortfolioPage.tsx
++++ b/ui/src/pages/PortfolioPage.tsx
+@@ -372,8 +372,8 @@ function contractDisplay(p: Position): { name: string; tag?: string } {
+   if (t === 'CRYPTO') {
+     return { name: sym, tag: 'spot' }
+   }
+-  // STK, CASH, BOND, CMDTY, etc. — just the symbol, no tag
+-  return { name: sym }
++  // STK, CASH, BOND, CMDTY, etc. — use description if set (e.g. "京东（JD）"), else symbol
++  return { name: c.description || sym }
+ }
+ 
+ function PositionsTable({ positions, fxRates }: { positions: PositionWithAccount[]; fxRates: FxRateInfo[] }) {

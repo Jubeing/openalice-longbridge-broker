@@ -18,14 +18,14 @@
 |------|------|
 | `init()` | 初始化 TradeContext 和 QuoteContext，验证 API 凭证，5 次重试 + 指数退避 |
 | `close()` | 关闭连接（SDK 自动释放） |
-| `searchContracts(pattern)` | 在本地静态注册表中搜索合约（支持精确匹配和前缀匹配，最多 50 条） |
+| `searchContracts(pattern)` | 在本地静态注册表中搜索合约（支持中文名、英文名、代码搜索；精确匹配最多 50 条） |
 | `getContractDetails(query)` | 根据合约解析 Longbridge 标的符号，返回合约详细信息 |
 | `placeOrder(contract, order, tpsl?)` | 提交订单，支持市价/限价/止损/跟踪止损/TPSL |
 | `modifyOrder(orderId, changes)` | 修改订单（价格、数量、跟踪百分比） |
 | `cancelOrder(orderId)` | 取消指定订单 |
 | `closePosition(contract, quantity?)` | 平仓（自动判断多空方向） |
-| `getAccount()` | 获取账户余额、购买力、净资产（多币种汇总） |
-| `getPositions()` | 获取持仓列表（含实时行情批量拉取） |
+| `getAccount()` | 获取账户余额、购买力、净资产（主账户货币，跨币种汇总需 FX 转换） |
+| `getPositions()` | 获取持仓列表（含实时行情批量拉取 + 中文名称动态获取） |
 | `getOrders(orderIds)` | 批量查询订单详情 |
 | `getOrder(orderId)` | 查询单个订单详情 |
 | `getQuote(contract)` | 获取实时行情（五档盘口、成交量、时间戳） |
@@ -111,12 +111,10 @@ export LONGBRIDGE_ACCESS_TOKEN="<Access Token>"
 
 | 文件 | 说明 |
 |------|------|
-| `src/domain/trading/brokers/longbridge/LongbridgeBroker.ts` | 核心 `IBroker` 实现（603 行） |
+| `src/domain/trading/brokers/longbridge/LongbridgeBroker.ts` | 核心 `IBroker` 实现 |
 | `src/domain/trading/brokers/longbridge/index.ts` | 模块导出 |
 | `src/domain/trading/brokers/longbridge/longbridge-types.ts` | TypeScript 类型定义 + 原始 API 类型 |
-| `src/domain/trading/brokers/longbridge/longbridge-contracts.ts` | 标的符号映射、合约解析、静态注册表（60+ 标的） |
-| `src/domain/trading/brokers/index.ts` | 导出 `LongbridgeBroker` |
-| `src/domain/trading/brokers/registry.ts` | 在工厂中注册 broker |
+| `src/domain/trading/brokers/longbridge/longbridge-contracts.ts` | 标的符号映射、O(1) 注册表查找、中文名称（60+ 标的） |
 | `package.json` | 添加 `longbridge` 依赖 |
 
 ## 静态合约注册表
