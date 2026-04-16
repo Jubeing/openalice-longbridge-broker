@@ -49,17 +49,33 @@
 
 ## 安装
 
+### 方式一：手动安装补丁
+
 ```bash
-# 1. 克隆 OpenAlice
+# 1. 克隆 OpenAlice（跳过如果已有）
 git clone https://github.com/TraderAlice/OpenAlice.git
 cd OpenAlice
 pnpm install
 
-# 2. 应用本补丁
+# 2. 克隆本仓库获取补丁文件
+git clone https://github.com/Jubeing/openalice-longbridge-broker.git
+cd openalice-longbridge-broker
+
+# 3. 回到 OpenAlice 目录，应用补丁
 git apply /path/to/longbridge-broker.patch
 
-# 3. 安装 longbridge 依赖
-pnpm add longbridge@^4.0.5
+# 4. 安装 longbridge 依赖（-w 表示写入 workspace 根目录）
+pnpm add -w longbridge@^4.0.5
+```
+
+### 方式二：下载补丁文件
+
+```bash
+git clone https://github.com/TraderAlice/OpenAlice.git
+cd OpenAlice
+curl -fsSL https://raw.githubusercontent.com/Jubeing/openalice-longbridge-broker/main/longbridge-broker.patch -o longbridge-broker.patch
+git apply longbridge-broker.patch
+pnpm add -w longbridge@^4.0.5
 ```
 
 ## 配置
