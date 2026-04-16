@@ -45,29 +45,33 @@ export function resolveSymbol(contract: Contract): string | null {
 
   if (!symbol) return null
 
+  // Extract raw symbol from "腾讯控股 (700.HK)" display format
+  const rawMatch = symbol.match(/\(([^)]+)\)$/i)
+  const rawSymbol = rawMatch ? rawMatch[1] : symbol
+
   // Already has a board suffix
-  if (/\.(HK|US|SH|SZ|SG)$/i.test(symbol)) {
-    return symbol.toUpperCase()
+  if (/\.(HK|US|SH|SZ|SG)$/i.test(rawSymbol)) {
+    return rawSymbol.toUpperCase()
   }
 
   // Derive from exchange + secType + currency
   if (secType === 'STK' || secType === 'CS' || !secType) {
-    if (currency === 'HKD') return `${symbol.toUpperCase()}.HK`
-    if (currency === 'USD') return `${symbol.toUpperCase()}.US`
+    if (currency === 'HKD') return `${rawSymbol.toUpperCase()}.HK`
+    if (currency === 'USD') return `${rawSymbol.toUpperCase()}.US`
     if (currency === 'CNH' || currency === 'RMB') {
       // Try Shanghai first (SH.600000 style = main index), then SZ
-      if (/^\d{6}$/.test(symbol)) {
+      if (/^\d{6}$/.test(rawSymbol)) {
         // Known Shanghai Stock Connect prefix ranges (simplified)
-        if (symbol.startsWith('6') || symbol.startsWith('9')) return `SH.${symbol}`
-        return `SZ.${symbol}`
+        if (rawSymbol.startsWith('6') || rawSymbol.startsWith('9')) return `SH.${rawSymbol}`
+        return `SZ.${rawSymbol}`
       }
-      return `SH.${symbol}`
+      return `SH.${rawSymbol}`
     }
-    if (currency === 'SGD') return `${symbol.toUpperCase()}.SG`
+    if (currency === 'SGD') return `${rawSymbol.toUpperCase()}.SG`
   }
 
   // Generic fallback
-  return symbol.toUpperCase()
+  return rawSymbol.toUpperCase()
 }
 
 /** Parse a Longbridge symbol string into IBKR-style Contract fields. */
@@ -77,26 +81,28 @@ export function parseSymbol(lbSymbol: string): {
   secType: string
   currency: string
 } {
-  const upper = lbSymbol.toUpperCase()
+  // Handle "腾讯控股 (700.HK)" display format — extract raw symbol from parentheses
+  const rawMatch = lbSymbol.match(/\(([^)]+)\)$/i)
+  const upper = (rawMatch ? rawMatch[1] : lbSymbol).toUpperCase()
 
   if (upper.endsWith('.HK')) {
-    return { symbol: upper.slice(0, -3), exchange: 'HKEX', secType: 'STK', currency: 'HKD' }
+    return { symbol: rawMatch ? lbSymbol : upper.slice(0, -3), exchange: 'HKEX', secType: 'STK', currency: 'HKD' }
   }
   if (upper.endsWith('.US')) {
-    return { symbol: upper.slice(0, -3), exchange: 'SMART', secType: 'STK', currency: 'USD' }
+    return { symbol: rawMatch ? lbSymbol : upper.slice(0, -3), exchange: 'SMART', secType: 'STK', currency: 'USD' }
   }
   if (upper.endsWith('.SH')) {
-    return { symbol: upper.slice(0, -3), exchange: 'SH', secType: 'STK', currency: 'CNH' }
+    return { symbol: rawMatch ? lbSymbol : upper.slice(0, -3), exchange: 'SH', secType: 'STK', currency: 'CNH' }
   }
   if (upper.endsWith('.SZ')) {
-    return { symbol: upper.slice(0, -3), exchange: 'SZ', secType: 'STK', currency: 'CNH' }
+    return { symbol: rawMatch ? lbSymbol : upper.slice(0, -3), exchange: 'SZ', secType: 'STK', currency: 'CNH' }
   }
   if (upper.endsWith('.SG')) {
-    return { symbol: upper.slice(0, -3), exchange: 'SGX', secType: 'STK', currency: 'SGD' }
+    return { symbol: rawMatch ? lbSymbol : upper.slice(0, -3), exchange: 'SGX', secType: 'STK', currency: 'SGD' }
   }
 
   // Plain symbol — assume US SMART
-  return { symbol: upper, exchange: 'SMART', secType: 'STK', currency: 'USD' }
+  return { symbol: lbSymbol, exchange: 'SMART', secType: 'STK', currency: 'USD' }
 }
 
 /** Build a fully qualified IBKR Contract from a Longbridge symbol string. */
@@ -107,6 +113,14 @@ export function makeContract(lbSymbol: string): Contract {
   c.exchange = parsed.exchange
   c.secType = parsed.secType
   c.currency = parsed.currency
+  // Find Chinese stock name from registry and prepend to symbol for display
+  const entry = STATIC_CONTRACT_REGISTRY.find(
+    e => e.lbSymbol.toUpperCase() === lbSymbol.toUpperCase(),
+  )
+  if (entry?.stockName) {
+    // e.g. "腾讯控股 (700.HK)" instead of just "700"
+    c.symbol = `${entry.stockName} (${lbSymbol.toUpperCase()})`
+  }
   return c
 }
 
