@@ -24,10 +24,10 @@ index dfb210d..7665fd0 100644
 +export type { LongbridgeBrokerConfig } from './longbridge/index.js'
 diff --git a/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts b/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts
 new file mode 100644
-index 0000000..d61e94a
+index 0000000..576fb3e
 --- /dev/null
 +++ b/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts
-@@ -0,0 +1,640 @@
+@@ -0,0 +1,638 @@
 +/**
 + * LongbridgeBroker — IBroker adapter for Longbridge (长桥证券)
 + *
@@ -86,7 +86,7 @@ index 0000000..d61e94a
 +  makeContract,
 +  mapOrderStatus,
 +  makeOrderState,
-+  STATIC_CONTRACT_REGISTRY,
++  lookupEntry,
 +} from './longbridge-contracts.js'
 +
 +import type { LongbridgeBrokerConfig } from './longbridge-types.js'
@@ -294,9 +294,7 @@ index 0000000..d61e94a
 +  async getContractDetails(query: Contract): Promise<ContractDetails | null> {
 +    const lbSymbol = resolveSymbol(query)
 +    if (!lbSymbol) return null
-+    const entry = STATIC_CONTRACT_REGISTRY.find(
-+      e => e.lbSymbol.toUpperCase() === lbSymbol.toUpperCase(),
-+    )
++    const entry = lookupEntry(lbSymbol)
 +    const details = new ContractDetails()
 +    details.contract = entry ? makeContract(entry.lbSymbol) : makeContract(lbSymbol)
 +    if (entry) {
