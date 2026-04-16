@@ -12,10 +12,10 @@ index c590852..af33134 100644
      "grammy": "^1.40.0",
 diff --git a/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts b/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts
 new file mode 100644
-index 0000000..ee51d3f
+index 0000000..d61e94a
 --- /dev/null
 +++ b/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts
-@@ -0,0 +1,628 @@
+@@ -0,0 +1,640 @@
 +/**
 + * LongbridgeBroker — IBroker adapter for Longbridge (长桥证券)
 + *
@@ -256,32 +256,26 @@ index 0000000..ee51d3f
 +    const needle = pattern.toUpperCase().trim()
 +    const results: ContractDescription[] = []
 +
++    // Single-pass: exact match → prefix match, supports EN + CN name + symbol + lbSymbol
 +    for (const entry of STATIC_CONTRACT_REGISTRY) {
-+      if (
-+        entry.symbol.toUpperCase()   === needle ||
-+        entry.lbSymbol.toUpperCase() === needle ||
-+        entry.stockName.toUpperCase().includes(needle)
-+      ) {
-+        const desc = new ContractDescription()
-+        desc.contract = makeContract(entry.lbSymbol)
-+        results.push(desc)
-+        if (results.length >= 50) break
-+      }
++      const sym   = entry.symbol.toUpperCase()
++      const lbSym = entry.lbSymbol.toUpperCase()
++      const nameEn = entry.stockName.toUpperCase()
++      const nameCn = entry.stockNameCn
++
++      const isExact = sym === needle || lbSym === needle || nameEn === needle
++      const isPartial = nameCn.includes(needle) || nameEn.includes(needle) || sym.startsWith(needle) || lbSym.startsWith(needle)
++
++      if (!isExact && !isPartial) continue
++
++      const desc = new ContractDescription()
++      desc.contract = makeContract(entry.lbSymbol)
++      results.push(desc)
++
++      // Cap exact matches at 50, partial at 20 more
++      if (results.length >= (isExact ? 50 : 70)) break
 +    }
 +
-+    if (results.length === 0) {
-+      for (const entry of STATIC_CONTRACT_REGISTRY) {
-+        if (
-+          entry.symbol.toUpperCase().startsWith(needle) ||
-+          entry.stockName.toUpperCase().includes(needle)
-+        ) {
-+          const desc = new ContractDescription()
-+          desc.contract = makeContract(entry.lbSymbol)
-+          results.push(desc)
-+          if (results.length >= 20) break
-+        }
-+      }
-+    }
 +    return results
 +  }
 +
@@ -421,23 +415,32 @@ index 0000000..ee51d3f
 +  async getAccount(): Promise<AccountInfo> {
 +    try {
 +      const rawBalances = await this.tradeCtx.accountBalance()
-+      let totalCash    = new LbDecimal(0)
-+      let totalNet     = new LbDecimal(0)
-+      let baseCurrency = 'HKD'
-+
-+      for (const bal of rawBalances) {
-+        totalCash    = totalCash.add(bal.totalCash)
-+        totalNet     = totalNet.add(bal.netAssets)
-+        baseCurrency = bal.currency || baseCurrency
++      if (rawBalances.length === 0) {
++        return {
++          baseCurrency:  'HKD',
++          netLiquidation: '0',
++          totalCashValue: '0',
++          unrealizedPnL: '0',
++          buyingPower:   '0',
++        }
 +      }
 +
++      // Longbridge does not expose cross-currency FX rates, so we cannot safely
++      // sum across currencies (e.g. HKD + USD + CNH). Report primary-account
++      // values in that account's base currency and note the limitation.
 +      const primary = rawBalances[0]
++      const totalNet  = primary.netAssets
++      const totalCash = primary.totalCash
++
 +      return {
-+        baseCurrency,
-+        netLiquidation:  lbToString(totalNet),
-+        totalCashValue:  lbToString(totalCash),
-+        unrealizedPnL:  '0',
-+        buyingPower:     primary ? lbToString(primary.buyPower) : lbToString(totalCash),
++        baseCurrency:   primary.currency || 'HKD',
++        netLiquidation: lbToString(totalNet),
++        totalCashValue: lbToString(totalCash),
++        // Unrealized PnL is calculated per-position in getPositions() and
++        // aggregated by the UTA layer; account-level unrealizedPnL is not
++        // available as a single figure from Longbridge.
++        unrealizedPnL: '0',
++        buyingPower:   lbToString(primary.buyPower),
 +      }
 +    } catch (err) {
 +      throw BrokerError.from(err)
@@ -473,8 +476,9 @@ index 0000000..ee51d3f
 +          for (const info of staticInfos) {
 +            if (info && info.nameCn) cnNames.set(info.symbol, info.nameCn)
 +          }
-+        } catch {
-+          // If quote/staticInfo fails, fallbacks apply
++        } catch (err) {
++          // staticInfo failure is non-fatal — Chinese names will fall back to registry/English.
++          console.warn(`LongbridgeBroker[${this.id}].getPositions: staticInfo failed:`, err)
 +        }
 +      }
 +
@@ -560,8 +564,10 @@ index 0000000..ee51d3f
 +      }
 +      return { isOpen: false, timestamp: new Date() }
 +    } catch (err) {
++      // Defensive: assume market closed on error to avoid accidentally placing
++      // orders during an API outage or weekend / holiday.
 +      console.warn(`LongbridgeBroker[${this.id}].getMarketClock failed:`, err)
-+      return { isOpen: true, timestamp: new Date() }
++      return { isOpen: false, timestamp: new Date() }
 +    }
 +  }
 +
@@ -613,12 +619,18 @@ index 0000000..ee51d3f
 +    return {
 +      contract,
 +      currency:     pos.currency ?? 'HKD',
++      // Longbridge StockPosition does not expose a long/short side field.
++      // initQuantity < 0 would indicate a short position but is not reliably
++      // set for all short positions — treat all as 'long' until API exposes it.
 +      side:         'long',
 +      quantity:     qty,
 +      avgCost:      lbToString(pos.costPrice),
 +      marketPrice:  mktPrice.toString(),
 +      marketValue:  qty.mul(mktPrice).mul(multiplier).abs().toString(),
 +      unrealizedPnL: mktPrice.sub(cost).mul(qty).mul(multiplier).toString(),
++      // Realized PnL is not exposed per position by Longbridge.
++      // It is calculated from execution history (todayExecutions / historyExecutions)
++      // which requires a separate aggregation pass; leave as 0 until needed.
 +      realizedPnL:  '0',
 +    }
 +  }
@@ -668,10 +680,10 @@ index 0000000..4fae0d8
 +} from './longbridge-contracts.js'
 diff --git a/src/domain/trading/brokers/longbridge/longbridge-contracts.ts b/src/domain/trading/brokers/longbridge/longbridge-contracts.ts
 new file mode 100644
-index 0000000..9de4f35
+index 0000000..c470d24
 --- /dev/null
 +++ b/src/domain/trading/brokers/longbridge/longbridge-contracts.ts
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,292 @@
 +/**
 + * Contract mapping between Longbridge and OpenAlice (IBKR-style).
 + *
@@ -782,10 +794,8 @@ index 0000000..9de4f35
 +  c.secType = parsed.secType
 +  c.currency = parsed.currency
 +
-+  // Set display description: "中文名（代码）"
-+  const entry = STATIC_CONTRACT_REGISTRY.find(
-+    e => e.lbSymbol.toUpperCase() === lbSymbol.toUpperCase(),
-+  )
++  // O(1) lookup for Chinese name: "中文名（代码）"
++  const entry = lookupEntry(lbSymbol)
 +  if (entry) {
 +    c.description = `${entry.stockNameCn}（${entry.symbol}）`
 +  }
@@ -848,6 +858,8 @@ index 0000000..9de4f35
 + *
 + * Coverage: HK (large-cap), US (major), SG ( Straits Times ),
 + * SH/SZ (Shanghai/Shenzhen A-share via Stock Connect).
++ *
++ * Exported as a plain array for search; also used to build LOOKUP map.
 + */
 +export const STATIC_CONTRACT_REGISTRY: Array<{
 +  symbol: string
@@ -858,7 +870,7 @@ index 0000000..9de4f35
 +  stockName: string
 +  stockNameCn: string
 +}> = [
-+  // ---- Hong Kong ----
++  // Pre-built lookup tables — always in sync with REGISTRY above
 +  { symbol: '700',   lbSymbol: '700.HK',   secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Tencent Holdings',         stockNameCn: '腾讯控股' },
 +  { symbol: '9988', lbSymbol: '9988.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Alibaba Group',         stockNameCn: '阿里巴巴' },
 +  { symbol: '3690', lbSymbol: '3690.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Meituan',               stockNameCn: '美团' },
@@ -951,6 +963,19 @@ index 0000000..9de4f35
 +  { symbol: 'ME8U',  lbSymbol: 'ME8U.SG',  secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'Mapletree Pan Asia Commercial Trust', stockNameCn: '凯德商用房产信托' },
 +  { symbol: 'BUOU',  lbSymbol: 'BUOU.SG',  secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'Mapletree Oakwood REIT', stockNameCn: '凯德乌节路信托' },
 +]
++
++/** O(1) lookup map built once from REGISTRY. */
++export const REGISTRY_LOOKUP = new Map<string, typeof STATIC_CONTRACT_REGISTRY[number]>(
++  STATIC_CONTRACT_REGISTRY.map(e => [e.lbSymbol.toUpperCase(), e]),
++)
++
++/**
++ * O(1) lookup for a registry entry by lbSymbol.
++ * Returns undefined if not found (caller decides fallback).
++ */
++export function lookupEntry(lbSymbol: string): typeof STATIC_CONTRACT_REGISTRY[number] | undefined {
++  return REGISTRY_LOOKUP.get(lbSymbol.toUpperCase())
++}
 diff --git a/src/domain/trading/brokers/longbridge/longbridge-types.ts b/src/domain/trading/brokers/longbridge/longbridge-types.ts
 new file mode 100644
 index 0000000..9c766df
