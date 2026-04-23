@@ -1,33 +1,1280 @@
-diff --git a/package.json b/package.json
-index c590852..af33134 100644
---- a/package.json
-+++ b/package.json
-@@ -46,6 +46,7 @@
-     "ccxt": "^4.5.38",
-     "chalk": "^5.6.2",
-     "decimal.js": "^10.6.0",
-+    "longbridge": "^4.0.5",
-     "express": "^5.2.1",
-     "file-type": "^21.3.2",
-     "grammy": "^1.40.0",
-diff --git a/src/domain/trading/brokers/index.ts b/src/domain/trading/brokers/index.ts
-index dfb210d..7665fd0 100644
---- a/src/domain/trading/brokers/index.ts
-+++ b/src/domain/trading/brokers/index.ts
-@@ -29,3 +29,7 @@ export type { CcxtBrokerConfig } from './ccxt/index.js'
- // IBKR
- export { IbkrBroker } from './ibkr/index.js'
- export type { IbkrBrokerConfig } from './ibkr/index.js'
-+
-+// Longbridge
-+export { LongbridgeBroker } from './longbridge/index.js'
-+export type { LongbridgeBrokerConfig } from './longbridge/index.js'
+diff --git a/longbridge-broker.patch b/longbridge-broker.patch
+index 847cc1c..e69de29 100644
+--- a/longbridge-broker.patch
++++ b/longbridge-broker.patch
+@@ -1,1266 +0,0 @@
+-diff --git a/package.json b/package.json
+-index c590852..af33134 100644
+---- a/package.json
+-+++ b/package.json
+-@@ -46,6 +46,7 @@
+-     "ccxt": "^4.5.38",
+-     "chalk": "^5.6.2",
+-     "decimal.js": "^10.6.0",
+-+    "longbridge": "^4.0.5",
+-     "express": "^5.2.1",
+-     "file-type": "^21.3.2",
+-     "grammy": "^1.40.0",
+-diff --git a/src/domain/trading/brokers/index.ts b/src/domain/trading/brokers/index.ts
+-index dfb210d..7665fd0 100644
+---- a/src/domain/trading/brokers/index.ts
+-+++ b/src/domain/trading/brokers/index.ts
+-@@ -29,3 +29,7 @@ export type { CcxtBrokerConfig } from './ccxt/index.js'
+- // IBKR
+- export { IbkrBroker } from './ibkr/index.js'
+- export type { IbkrBrokerConfig } from './ibkr/index.js'
+-+
+-+// Longbridge
+-+export { LongbridgeBroker } from './longbridge/index.js'
+-+export type { LongbridgeBrokerConfig } from './longbridge/index.js'
+-diff --git a/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts b/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts
+-new file mode 100644
+-index 0000000..576fb3e
+---- /dev/null
+-+++ b/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts
+-@@ -0,0 +1,638 @@
+-+/**
+-+ * LongbridgeBroker — IBroker adapter for Longbridge (长桥证券)
+-+ *
+-+ * Supports: HK, US, Shanghai (SH), Shenzhen (SZ), Singapore (SG) equities.
+-+ *
+-+ * Authentication:
+-+ *   Configure via Config.fromApikeyEnv() (reads LONGBRIDGE_APP_KEY,
+-+ *   LONGBRIDGE_APP_SECRET, LONGBRIDGE_ACCESS_TOKEN) or pass credentials
+-+ *   directly in brokerConfig.
+-+ *
+-+ * Symbol format:
+-+ *   HK: "700.HK"        US: "AAPL.US"
+-+ *   Shanghai: "SH.600000"    Shenzhen: "SZ.000001"
+-+ *   Singapore: "STI.SG"
+-+ */
+-+
+-+import { z } from 'zod'
+-+import Decimal from 'decimal.js'
+-+import {
+-+  Contract,
+-+  ContractDescription,
+-+  ContractDetails,
+-+  Order,
+-+  UNSET_DOUBLE,
+-+  UNSET_DECIMAL,
+-+} from '@traderalice/ibkr'
+-+import {
+-+  BrokerError,
+-+  type IBroker,
+-+  type AccountCapabilities,
+-+  type AccountInfo,
+-+  type Position,
+-+  type PlaceOrderResult,
+-+  type OpenOrder,
+-+  type Quote,
+-+  type MarketClock,
+-+  type BrokerConfigField,
+-+  type TpSlParams,
+-+} from '../types.js'
+-+import '../../contract-ext.js'
+-+
+-+import {
+-+  Config,
+-+  TradeContext,
+-+  QuoteContext,
+-+  Decimal as LbDecimal,
+-+  OrderType as LbOrderType,
+-+  OrderSide as LbOrderSide,
+-+  TimeInForceType as LbTimeInForceType,
+-+  OrderStatus as LbOrderStatus,
+-+  StockPosition,
+-+} from 'longbridge'
+-+
+-+import {
+-+  resolveSymbol,
+-+  makeContract,
+-+  mapOrderStatus,
+-+  makeOrderState,
+-+  lookupEntry,
+-+} from './longbridge-contracts.js'
+-+
+-+import type { LongbridgeBrokerConfig } from './longbridge-types.js'
+-+
+-+// ==================== Helpers ====================
+-+
+-+/** Convert Longbridge Decimal (NAPI-RS) to plain numeric string. */
+-+function lbToString(d: LbDecimal | null | undefined): string {
+-+  return d ? d.toString() : '0'
+-+}
+-+
+-+/** Convert Longbridge Decimal (NAPI-RS) to number. */
+-+function lbToNumber(d: LbDecimal | null | undefined): number {
+-+  return d ? d.toNumber() : 0
+-+}
+-+
+-+// ==================== Order type mapping ====================
+-+
+-+function ibkrOrderTypeToLb(orderType: string): LbOrderType {
+-+  switch (orderType) {
+-+    case 'LMT':      return LbOrderType.LO
+-+    case 'ELO':      return LbOrderType.ELO
+-+    case 'MKT':      return LbOrderType.MO
+-+    case 'AO':       return LbOrderType.AO
+-+    case 'ALO':      return LbOrderType.ALO
+-+    case 'ODD':      return LbOrderType.ODD
+-+    case 'STP':
+-+    case 'STP LMT':  return LbOrderType.LIT
+-+    case 'LIT':      return LbOrderType.LIT
+-+    case 'MIT':      return LbOrderType.MIT
+-+    case 'TSLPPCT':  return LbOrderType.TSLPPCT
+-+    case 'TSL':
+-+    case 'TSLPAMT': return LbOrderType.TSLPAMT
+-+    case 'TSMAMT':  return LbOrderType.TSMAMT
+-+    case 'TSMPCT':  return LbOrderType.TSMPCT
+-+    default:         return LbOrderType.LO
+-+  }
+-+}
+-+
+-+function ibkrTifToLb(tif: string): LbTimeInForceType {
+-+  switch (tif) {
+-+    case 'DAY': return LbTimeInForceType.Day
+-+    case 'GTC': return LbTimeInForceType.GoodTilCanceled
+-+    case 'GTD': return LbTimeInForceType.GoodTilDate
+-+    default:    return LbTimeInForceType.Day
+-+  }
+-+}
+-+
+-+function lbStatusToIbkr(status: LbOrderStatus): string {
+-+  switch (status) {
+-+    case LbOrderStatus.Filled:          return 'Filled'
+-+    case LbOrderStatus.PartialFilled:  return 'Submitted'
+-+    case LbOrderStatus.Canceled:        return 'Cancelled'
+-+    case LbOrderStatus.Rejected:        return 'Rejected'
+-+    case LbOrderStatus.Expired:         return 'Expired'
+-+    case LbOrderStatus.New:
+-+    case LbOrderStatus.WaitToNew:
+-+    case LbOrderStatus.WaitToReplace:
+-+    case LbOrderStatus.PendingReplace:
+-+    case LbOrderStatus.Replaced:
+-+    case LbOrderStatus.WaitToCancel:
+-+    case LbOrderStatus.PendingCancel:
+-+    case LbOrderStatus.NotReported:
+-+    case LbOrderStatus.ReplacedNotReported:
+-+    case LbOrderStatus.ProtectedNotReported:
+-+    case LbOrderStatus.VarietiesNotReported:
+-+      return 'Submitted'
+-+    default:
+-+      return 'Submitted'
+-+  }
+-+}
+-+
+-+// ==================== Broker ====================
+-+
+-+export class LongbridgeBroker implements IBroker {
+-+
+-+  // ---- Self-registration ----
+-+
+-+  static configSchema = z.object({
+-+    appKey:       z.string().optional(),
+-+    appSecret:    z.string().optional(),
+-+    accessToken:  z.string().optional(),
+-+    live:         z.boolean().default(false),
+-+  })
+-+
+-+  static configFields: BrokerConfigField[] = [
+-+    { name: 'appKey',       type: 'password', label: 'App Key',        required: true, sensitive: true,
+-+      description: 'Longbridge app key from app.longbridge.global → Settings → API' },
+-+    { name: 'appSecret',    type: 'password', label: 'App Secret',    required: true, sensitive: true,
+-+      description: 'Longbridge app secret' },
+-+    { name: 'accessToken',  type: 'password', label: 'Access Token', required: true, sensitive: true,
+-+      description: 'Longbridge access token (long-lived OAuth bearer token)' },
+-+    { name: 'live',         type: 'boolean',  label: 'Live Trading', default: false,
+-+      description: 'When disabled, routes to test/paper environment. Enable only when ready for real orders.' },
+-+  ]
+-+
+-+  static fromConfig(config: {
+-+    id: string; label?: string; brokerConfig: Record<string, unknown>
+-+  }): LongbridgeBroker {
+-+    const bc = LongbridgeBroker.configSchema.parse(config.brokerConfig)
+-+    return new LongbridgeBroker({
+-+      id:          config.id,
+-+      label:       config.label,
+-+      appKey:      bc.appKey,
+-+      appSecret:   bc.appSecret,
+-+      accessToken: bc.accessToken,
+-+      live:        bc.live,
+-+    })
+-+  }
+-+
+-+  // ---- Instance ----
+-+
+-+  readonly id: string
+-+  readonly label: string
+-+
+-+  private tradeCtx!: TradeContext
+-+  private quoteCtx!: QuoteContext
+-+  private readonly config: LongbridgeBrokerConfig
+-+
+-+  constructor(config: LongbridgeBrokerConfig) {
+-+    this.config = config
+-+    this.id    = config.id    ?? (config.live ? 'longbridge-live' : 'longbridge')
+-+    this.label = config.label ?? (config.live ? 'Longbridge Live' : 'Longbridge')
+-+  }
+-+
+-+  // ---- Lifecycle ----
+-+
+-+  private static readonly MAX_INIT_RETRIES   = 5
+-+  private static readonly MAX_AUTH_RETRIES   = 3
+-+  private static readonly INIT_RETRY_BASE_MS = 1000
+-+
+-+  async init(): Promise<void> {
+-+    const { appKey, appSecret, accessToken } = this.config
+-+
+-+    const cfg: Config =
+-+      (appKey && appSecret && accessToken)
+-+        ? Config.fromApikey(appKey, appSecret, accessToken)
+-+        : Config.fromApikeyEnv()
+-+
+-+    let lastErr: unknown
+-+    for (let attempt = 1; attempt <= LongbridgeBroker.MAX_INIT_RETRIES; attempt++) {
+-+      try {
+-+        const [tc, qc] = await Promise.all([
+-+          TradeContext.new(cfg),
+-+          QuoteContext.new(cfg),
+-+        ])
+-+        this.tradeCtx = tc
+-+        this.quoteCtx  = qc
+-+
+-+        const balances = await this.tradeCtx.accountBalance()
+-+        console.log(
+-+          `LongbridgeBroker[${this.id}]: connected (accounts=${balances.length})`,
+-+        )
+-+        return
+-+      } catch (err) {
+-+        lastErr = err
+-+        const isAuth = err instanceof Error && /401|unauthorized|invalid/i.test(err.message)
+-+        if (isAuth && attempt >= LongbridgeBroker.MAX_AUTH_RETRIES) {
+-+          throw new BrokerError('AUTH', `Longbridge authentication failed — check your API credentials.`)
+-+        }
+-+        if (attempt < LongbridgeBroker.MAX_INIT_RETRIES) {
+-+          const delay = LongbridgeBroker.INIT_RETRY_BASE_MS * 2 ** (attempt - 1)
+-+          console.warn(`LongbridgeBroker[${this.id}]: init attempt ${attempt} failed, retrying in ${delay}ms…`)
+-+          await new Promise(r => setTimeout(r, delay))
+-+        }
+-+      }
+-+    }
+-+    throw lastErr
+-+  }
+-+
+-+  async close(): Promise<void> {
+-+    // Longbridge SDK auto-releases on process exit
+-+  }
+-+
+-+  // ---- Contract search ----
+-+
+-+  async searchContracts(pattern: string): Promise<ContractDescription[]> {
+-+    if (!pattern) return []
+-+    const needle = pattern.toUpperCase().trim()
+-+    const results: ContractDescription[] = []
+-+
+-+    // Single-pass: exact match → prefix match, supports EN + CN name + symbol + lbSymbol
+-+    for (const entry of STATIC_CONTRACT_REGISTRY) {
+-+      const sym   = entry.symbol.toUpperCase()
+-+      const lbSym = entry.lbSymbol.toUpperCase()
+-+      const nameEn = entry.stockName.toUpperCase()
+-+      const nameCn = entry.stockNameCn
+-+
+-+      const isExact = sym === needle || lbSym === needle || nameEn === needle
+-+      const isPartial = nameCn.includes(needle) || nameEn.includes(needle) || sym.startsWith(needle) || lbSym.startsWith(needle)
+-+
+-+      if (!isExact && !isPartial) continue
+-+
+-+      const desc = new ContractDescription()
+-+      desc.contract = makeContract(entry.lbSymbol)
+-+      results.push(desc)
+-+
+-+      // Cap exact matches at 50, partial at 20 more
+-+      if (results.length >= (isExact ? 50 : 70)) break
+-+    }
+-+
+-+    return results
+-+  }
+-+
+-+  async getContractDetails(query: Contract): Promise<ContractDetails | null> {
+-+    const lbSymbol = resolveSymbol(query)
+-+    if (!lbSymbol) return null
+-+    const entry = lookupEntry(lbSymbol)
+-+    const details = new ContractDetails()
+-+    details.contract = entry ? makeContract(entry.lbSymbol) : makeContract(lbSymbol)
+-+    if (entry) {
+-+      details.contract.description = entry.stockName
+-+      details.validExchanges     = entry.exchange
+-+      details.orderTypes         = 'MKT,LMT,STP,LIT,MIT,TSMAMT,TSLPPCT'
+-+      details.stockType          = 'COMMON'
+-+    }
+-+    return details
+-+  }
+-+
+-+  // ---- Trading operations ----
+-+
+-+  async placeOrder(
+-+    contract: Contract,
+-+    order: Order,
+-+    tpsl?: TpSlParams,
+-+  ): Promise<PlaceOrderResult> {
+-+    const lbSymbol = resolveSymbol(contract)
+-+    if (!lbSymbol) {
+-+      return { success: false, error: `Cannot resolve contract to Longbridge symbol` }
+-+    }
+-+
+-+    try {
+-+      const opts: Record<string, unknown> = {
+-+        symbol:       lbSymbol,
+-+        side:        order.action === 'BUY' ? LbOrderSide.Buy : LbOrderSide.Sell,
+-+        orderType:   ibkrOrderTypeToLb(order.orderType),
+-+        timeInForce: ibkrTifToLb(order.tif ?? 'DAY'),
+-+      }
+-+
+-+      if (!order.totalQuantity.equals(UNSET_DECIMAL)) {
+-+        opts.submittedQuantity = new LbDecimal(order.totalQuantity.toString())
+-+      } else if (order.cashQty !== UNSET_DOUBLE) {
+-+        opts.submittedQuantity = new LbDecimal(order.cashQty)
+-+      }
+-+
+-+      if (order.lmtPrice !== UNSET_DOUBLE) {
+-+        opts.submittedPrice = new LbDecimal(order.lmtPrice)
+-+      }
+-+      if (order.auxPrice !== UNSET_DOUBLE) {
+-+        if (order.orderType === 'TRAIL') {
+-+          opts.trailingAmount = new LbDecimal(order.auxPrice)
+-+        } else {
+-+          opts.triggerPrice = new LbDecimal(order.auxPrice)
+-+        }
+-+      }
+-+      if (order.trailingPercent !== UNSET_DOUBLE) {
+-+        opts.trailingPercent = new LbDecimal(order.trailingPercent)
+-+      }
+-+      if (order.outsideRth) {
+-+        opts.outsideRth = 2  // AnyTime
+-+      }
+-+
+-+      if (tpsl?.takeProfit || tpsl?.stopLoss) {
+-+        if (tpsl.takeProfit) opts.takeProfitPrice = new LbDecimal(tpsl.takeProfit.price)
+-+        if (tpsl.stopLoss)   opts.stopLossPrice  = new LbDecimal(tpsl.stopLoss.price)
+-+      }
+-+
+-+      const response = await this.tradeCtx.submitOrder(opts as never)
+-+
+-+      return {
+-+        success: true,
+-+        orderId: response.orderId,
+-+        message: `Order submitted: ${response.orderId}`,
+-+      }
+-+    } catch (err) {
+-+      const msg = err instanceof Error ? err.message : String(err)
+-+      if (/market.?closed|not.?open|trading.?halt/i.test(msg)) {
+-+        throw new BrokerError('MARKET_CLOSED', msg)
+-+      }
+-+      return { success: false, error: msg }
+-+    }
+-+  }
+-+
+-+  async modifyOrder(orderId: string, changes: Partial<Order>): Promise<PlaceOrderResult> {
+-+    try {
+-+      const opts: Record<string, unknown> = { orderId }
+-+      if (changes.totalQuantity != null && !changes.totalQuantity.equals(UNSET_DECIMAL)) {
+-+        opts.quantity = new LbDecimal(changes.totalQuantity.toString())
+-+      }
+-+      if (changes.lmtPrice != null && changes.lmtPrice !== UNSET_DOUBLE) {
+-+        opts.price = new LbDecimal(changes.lmtPrice)
+-+      }
+-+      if (changes.auxPrice != null && changes.auxPrice !== UNSET_DOUBLE) {
+-+        opts.triggerPrice = new LbDecimal(changes.auxPrice)
+-+      }
+-+      if (changes.trailingPercent != null && changes.trailingPercent !== UNSET_DOUBLE) {
+-+        opts.trailingPercent = new LbDecimal(changes.trailingPercent)
+-+      }
+-+      await this.tradeCtx.replaceOrder(opts as never)
+-+      return { success: true, orderId, message: `Order ${orderId} replaced` }
+-+    } catch (err) {
+-+      return { success: false, error: err instanceof Error ? err.message : String(err) }
+-+    }
+-+  }
+-+
+-+  async cancelOrder(orderId: string): Promise<PlaceOrderResult> {
+-+    try {
+-+      await this.tradeCtx.cancelOrder(orderId)
+-+      return { success: true, orderId, orderState: makeOrderState('Canceled') }
+-+    } catch (err) {
+-+      return { success: false, error: err instanceof Error ? err.message : String(err) }
+-+    }
+-+  }
+-+
+-+  async closePosition(contract: Contract, quantity?: Decimal): Promise<PlaceOrderResult> {
+-+    const lbSymbol = resolveSymbol(contract)
+-+    if (!lbSymbol) return { success: false, error: 'Cannot resolve symbol' }
+-+
+-+    const positions = await this.getPositions()
+-+    const pos = positions.find(p => {
+-+      const ps = resolveSymbol(p.contract)
+-+      return ps?.toUpperCase() === lbSymbol.toUpperCase()
+-+    })
+-+    if (!pos) return { success: false, error: `No position for ${lbSymbol}` }
+-+
+-+    const order = new Order()
+-+    order.action        = pos.side === 'long' ? 'SELL' : 'BUY'
+-+    order.orderType     = 'MKT'
+-+    order.totalQuantity = quantity ?? pos.quantity
+-+
+-+    return this.placeOrder(contract, order)
+-+  }
+-+
+-+  // ---- Queries ----
+-+
+-+  async getAccount(): Promise<AccountInfo> {
+-+    try {
+-+      const rawBalances = await this.tradeCtx.accountBalance()
+-+      if (rawBalances.length === 0) {
+-+        return {
+-+          baseCurrency:  'HKD',
+-+          netLiquidation: '0',
+-+          totalCashValue: '0',
+-+          unrealizedPnL: '0',
+-+          buyingPower:   '0',
+-+        }
+-+      }
+-+
+-+      // Longbridge does not expose cross-currency FX rates, so we cannot safely
+-+      // sum across currencies (e.g. HKD + USD + CNH). Report primary-account
+-+      // values in that account's base currency and note the limitation.
+-+      const primary = rawBalances[0]
+-+      const totalNet  = primary.netAssets
+-+      const totalCash = primary.totalCash
+-+
+-+      return {
+-+        baseCurrency:   primary.currency || 'HKD',
+-+        netLiquidation: lbToString(totalNet),
+-+        totalCashValue: lbToString(totalCash),
+-+        // Unrealized PnL is calculated per-position in getPositions() and
+-+        // aggregated by the UTA layer; account-level unrealizedPnL is not
+-+        // available as a single figure from Longbridge.
+-+        unrealizedPnL: '0',
+-+        buyingPower:   lbToString(primary.buyPower),
+-+      }
+-+    } catch (err) {
+-+      throw BrokerError.from(err)
+-+    }
+-+  }
+-+
+-+  async getPositions(): Promise<Position[]> {
+-+    try {
+-+      const resp = await this.tradeCtx.stockPositions()
+-+      const channels = resp.channels ?? []
+-+      const positions: Position[] = []
+-+      const symbols: string[] = []
+-+
+-+      // Collect all position symbols for batch quote
+-+      for (const channel of channels) {
+-+        for (const pos of channel.positions ?? []) {
+-+          symbols.push(pos.symbol)
+-+        }
+-+      }
+-+
+-+      // Fetch live quotes and Chinese names in parallel
+-+      let livePrices: Map<string, number> = new Map()
+-+      let cnNames: Map<string, string> = new Map()
+-+      if (symbols.length > 0) {
+-+        try {
+-+          const [quotes, staticInfos] = await Promise.all([
+-+            this.quoteCtx.quote(symbols),
+-+            this.quoteCtx.staticInfo(symbols),
+-+          ])
+-+          for (const q of quotes) {
+-+            if (q) livePrices.set(q.symbol, lbToNumber(q.lastDone))
+-+          }
+-+          for (const info of staticInfos) {
+-+            if (info && info.nameCn) cnNames.set(info.symbol, info.nameCn)
+-+          }
+-+        } catch (err) {
+-+          // staticInfo failure is non-fatal — Chinese names will fall back to registry/English.
+-+          console.warn(`LongbridgeBroker[${this.id}].getPositions: staticInfo failed:`, err)
+-+        }
+-+      }
+-+
+-+      for (const channel of channels) {
+-+        for (const pos of channel.positions ?? []) {
+-+          positions.push(this.mapStockPosition(pos, livePrices, cnNames))
+-+        }
+-+      }
+-+      return positions
+-+    } catch (err) {
+-+      throw BrokerError.from(err)
+-+    }
+-+  }
+-+
+-+  async getOrders(orderIds: string[]): Promise<OpenOrder[]> {
+-+    const results: OpenOrder[] = []
+-+    for (const id of orderIds) {
+-+      const order = await this.getOrder(id)
+-+      if (order) results.push(order)
+-+    }
+-+    return results
+-+  }
+-+
+-+  async getOrder(orderId: string): Promise<OpenOrder | null> {
+-+    try {
+-+      const raw = await this.tradeCtx.orderDetail(orderId)
+-+      return this.mapOpenOrder(raw)
+-+    } catch {
+-+      return null
+-+    }
+-+  }
+-+
+-+  async getQuote(contract: Contract): Promise<Quote> {
+-+    const lbSymbol = resolveSymbol(contract)
+-+    if (!lbSymbol) throw new BrokerError('EXCHANGE', 'Cannot resolve symbol')
+-+
+-+    try {
+-+      const [quotes, depthData] = await Promise.all([
+-+        this.quoteCtx.quote([lbSymbol]),
+-+        this.quoteCtx.depth(lbSymbol),
+-+      ])
+-+      const q = quotes[0]
+-+      if (!q) throw new BrokerError('EXCHANGE', `No quote for ${lbSymbol}`)
+-+
+-+      // SecurityDepth.bids/asks — each element has .price (Decimal) and .volume
+-+      const bids = depthData.bids ?? []
+-+      const asks = depthData.asks ?? []
+-+
+-+      return {
+-+        contract:  makeContract(lbSymbol),
+-+        last:      lbToNumber(q.lastDone),
+-+        bid:       bids[0]?.price ? lbToNumber(bids[0].price) : 0,
+-+        ask:       asks[0]?.price ? lbToNumber(asks[0].price) : 0,
+-+        volume:    q.volume ?? 0,
+-+        high:      lbToNumber(q.high ?? null),
+-+        low:       lbToNumber(q.low ?? null),
+-+        timestamp: q.timestamp ?? new Date(),
+-+      }
+-+    } catch (err) {
+-+      throw BrokerError.from(err)
+-+    }
+-+  }
+-+
+-+  // ---- Market Clock ----
+-+
+-+  async getMarketClock(): Promise<MarketClock> {
+-+    try {
+-+      const sessions = await this.quoteCtx.tradingSession()
+-+      const nowMs = Date.now()
+-+
+-+      for (const mts of sessions) {
+-+        for (const s of mts.tradeSessions) {
+-+          // TradingSessionInfo.beginTime / endTime are NAPI-RS Time objects
+-+          // Time has .toString() returning "HH:mm:ss" — reconstruct as today's datetime
+-+          const today = new Date().toISOString().split('T')[0]
+-+          const beginMs = new Date(`${today}T${s.beginTime}`).getTime()
+-+          const endMs   = new Date(`${today}T${s.endTime}`).getTime()
+-+          if (nowMs >= beginMs && nowMs <= endMs) {
+-+            // 0 = Intraday = main session = market open
+-+            return { isOpen: s.tradeSession === 0, timestamp: new Date() }
+-+          }
+-+        }
+-+      }
+-+      return { isOpen: false, timestamp: new Date() }
+-+    } catch (err) {
+-+      // Defensive: assume market closed on error to avoid accidentally placing
+-+      // orders during an API outage or weekend / holiday.
+-+      console.warn(`LongbridgeBroker[${this.id}].getMarketClock failed:`, err)
+-+      return { isOpen: false, timestamp: new Date() }
+-+    }
+-+  }
+-+
+-+  // ---- Capabilities ----
+-+
+-+  getCapabilities(): AccountCapabilities {
+-+    return {
+-+      supportedSecTypes:   ['STK', 'CS'],
+-+      supportedOrderTypes: ['MKT', 'LMT', 'STP', 'STP LMT', 'LIT', 'MIT', 'TSMAMT', 'TSLPPCT', 'TSMPCT'],
+-+    }
+-+  }
+-+
+-+  // ---- Contract identity ----
+-+
+-+  getNativeKey(contract: Contract): string {
+-+    return resolveSymbol(contract) ?? contract.symbol ?? ''
+-+  }
+-+
+-+  resolveNativeKey(nativeKey: string): Contract {
+-+    return makeContract(nativeKey)
+-+  }
+-+
+-+  // ---- Internal ----
+-+
+-+  /** Detect if a Longbridge symbol is a US equity option (e.g. AAPL250517C00150000.US) */
+-+  private isOption(symbol: string): boolean {
+-+    return /^([A-Z]{1,5})(\d{6})([CP])(\d+)\.(US|HK)$/.test(symbol.toUpperCase())
+-+  }
+-+
+-+  private mapStockPosition(pos: StockPosition, livePrices: Map<string, number>, cnNames?: Map<string, string>): Position {
+-+    const contract = makeContract(pos.symbol)
+-+    // Priority: Longbridge API nameCn (latest) > registry Chinese name > symbolName (English) > symbol
+-+    const apiCnName = cnNames?.get(pos.symbol)
+-+    if (apiCnName) {
+-+      // Use API Chinese name — append code in brackets
+-+      contract.description = `${apiCnName}（${contract.symbol}）`
+-+    } else if (!contract.description) {
+-+      // Fallback to registry or English name
+-+      contract.description = pos.symbolName ?? pos.symbol
+-+    }
+-+    const qty          = new Decimal(lbToString(pos.quantity))
+-+    const cost         = new Decimal(lbToString(pos.costPrice))
+-+    const livePrice    = livePrices.get(pos.symbol)
+-+    const mktPrice     = livePrice !== undefined ? new Decimal(livePrice) : cost
+-+    // Options use contract multiplier of 100 (each contract = 100 shares)
+-+    const isOpt        = this.isOption(pos.symbol)
+-+    const multiplier   = isOpt ? new Decimal(100) : new Decimal(1)
+-+
+-+    return {
+-+      contract,
+-+      currency:     pos.currency ?? 'HKD',
+-+      // Longbridge StockPosition does not expose a long/short side field.
+-+      // initQuantity < 0 would indicate a short position but is not reliably
+-+      // set for all short positions — treat all as 'long' until API exposes it.
+-+      side:         'long',
+-+      quantity:     qty,
+-+      avgCost:      lbToString(pos.costPrice),
+-+      marketPrice:  mktPrice.toString(),
+-+      marketValue:  qty.mul(mktPrice).mul(multiplier).abs().toString(),
+-+      unrealizedPnL: mktPrice.sub(cost).mul(qty).mul(multiplier).toString(),
+-+      // Realized PnL is not exposed per position by Longbridge.
+-+      // It is calculated from execution history (todayExecutions / historyExecutions)
+-+      // which requires a separate aggregation pass; leave as 0 until needed.
+-+      realizedPnL:  '0',
+-+    }
+-+  }
+-+
+-+  private mapOpenOrder(o: import('longbridge').OrderDetail): OpenOrder {
+-+    const contract = makeContract(o.symbol)
+-+
+-+    const order = new Order()
+-+    order.action         = o.side === LbOrderSide.Buy ? 'BUY' : 'SELL'
+-+    order.totalQuantity  = new Decimal(o.quantity.toString())
+-+    order.orderType      = String(o.orderType)
+-+    if (o.price)         order.lmtPrice = lbToNumber(o.price)
+-+    if (o.triggerPrice)  order.auxPrice = lbToNumber(o.triggerPrice)
+-+    if (o.timeInForce)   order.tif = String(o.timeInForce)
+-+    if (o.outsideRth != null) order.outsideRth = o.outsideRth === 2
+-+    order.orderId = 0   // numeric IBKR convention; string ID in orderId field
+-+
+-+    return {
+-+      contract,
+-+      order,
+-+      orderState:  makeOrderState(lbStatusToIbkr(o.status)),
+-+      avgFillPrice: lbToNumber(o.executedPrice),
+-+    }
+-+  }
+-+}
+-diff --git a/src/domain/trading/brokers/longbridge/index.ts b/src/domain/trading/brokers/longbridge/index.ts
+-new file mode 100644
+-index 0000000..4fae0d8
+---- /dev/null
+-+++ b/src/domain/trading/brokers/longbridge/index.ts
+-@@ -0,0 +1,16 @@
+-+/**
+-+ * LongbridgeBroker — OpenAlice broker adapter for Longbridge (长桥证券).
+-+ *
+-+ * Supports: Hong Kong (HK), United States (US), Shanghai (SH),
+-+ * Shenzhen (SZ), Singapore (SG) equity markets.
+-+ *
+-+ * @module
+-+ */
+-+
+-+export { LongbridgeBroker } from './LongbridgeBroker.js'
+-+export type { LongbridgeBrokerConfig } from './longbridge-types.js'
+-+export {
+-+  resolveSymbol,
+-+  makeContract,
+-+  STATIC_CONTRACT_REGISTRY,
+-+} from './longbridge-contracts.js'
+-diff --git a/src/domain/trading/brokers/longbridge/longbridge-contracts.ts b/src/domain/trading/brokers/longbridge/longbridge-contracts.ts
+-new file mode 100644
+-index 0000000..c470d24
+---- /dev/null
+-+++ b/src/domain/trading/brokers/longbridge/longbridge-contracts.ts
+-@@ -0,0 +1,292 @@
+-+/**
+-+ * Contract mapping between Longbridge and OpenAlice (IBKR-style).
+-+ *
+-+ * Longbridge symbol format:
+-+ *   HK equities:  "700.HK"
+-+ *   US equities: "AAPL.US"
+-+ *   Shanghai:     "SH.600000"
+-+ *   Shenzhen:     "SZ.000001"
+-+ *   Singapore:    "STI.SG"
+-+ *
+-+ * Longbridge Market enum (from 'longbridge'):
+-+ *   1  = US Mainland
+-+ *   6  = HK Equity
+-+ *   13 = Shanghai Stock Connect
+-+ *   18 = Shenzhen Stock Connect
+-+ *   22 = Singapore
+-+ *
+-+ * SecurityBoard enum:
+-+ *   HK = Hong Kong listed
+-+ *   US = US listed
+-+ *   SH = Shanghai A shares
+-+ *   SZ = Shenzhen A shares
+-+ *   SG = Singapore
+-+ */
+-+
+-+import { Contract, OrderState } from '@traderalice/ibkr'
+-+import '../../contract-ext.js'
+-+
+-+// ---- Longbridge Market and Board helpers ----
+-+
+-+export function lbMarketToBoard(market: number): string {
+-+  switch (market) {
+-+    case 6:  return 'HK'
+-+    case 1:  return 'US'
+-+    case 13: return 'SH'
+-+    case 18: return 'SZ'
+-+    case 22: return 'SG'
+-+    default: return 'Unknown'
+-+  }
+-+}
+-+
+-+/** Build the Longbridge native symbol string from a Contract. */
+-+export function resolveSymbol(contract: Contract): string | null {
+-+  const { symbol, exchange, secType, currency } = contract
+-+
+-+  if (!symbol) return null
+-+
+-+  // Already has a board suffix
+-+  if (/\.(HK|US|SH|SZ|SG)$/i.test(symbol)) {
+-+    return symbol.toUpperCase()
+-+  }
+-+
+-+  // Derive from exchange + secType + currency
+-+  if (secType === 'STK' || secType === 'CS' || !secType) {
+-+    if (currency === 'HKD') return `${symbol.toUpperCase()}.HK`
+-+    if (currency === 'USD') return `${symbol.toUpperCase()}.US`
+-+    if (currency === 'CNH' || currency === 'RMB') {
+-+      // Try Shanghai first (SH.600000 style = main index), then SZ
+-+      if (/^\d{6}$/.test(symbol)) {
+-+        // Known Shanghai Stock Connect prefix ranges (simplified)
+-+        if (symbol.startsWith('6') || symbol.startsWith('9')) return `SH.${symbol}`
+-+        return `SZ.${symbol}`
+-+      }
+-+      return `SH.${symbol}`
+-+    }
+-+    if (currency === 'SGD') return `${symbol.toUpperCase()}.SG`
+-+  }
+-+
+-+  // Generic fallback
+-+  return symbol.toUpperCase()
+-+}
+-+
+-+/** Parse a Longbridge symbol string into IBKR-style Contract fields. */
+-+export function parseSymbol(lbSymbol: string): {
+-+  symbol: string
+-+  exchange: string
+-+  secType: string
+-+  currency: string
+-+} {
+-+  const upper = lbSymbol.toUpperCase()
+-+
+-+  if (upper.endsWith('.HK')) {
+-+    return { symbol: upper.slice(0, -3), exchange: 'HKEX', secType: 'STK', currency: 'HKD' }
+-+  }
+-+  if (upper.endsWith('.US')) {
+-+    return { symbol: upper.slice(0, -3), exchange: 'SMART', secType: 'STK', currency: 'USD' }
+-+  }
+-+  if (upper.endsWith('.SH')) {
+-+    return { symbol: upper.slice(0, -3), exchange: 'SH', secType: 'STK', currency: 'CNH' }
+-+  }
+-+  if (upper.endsWith('.SZ')) {
+-+    return { symbol: upper.slice(0, -3), exchange: 'SZ', secType: 'STK', currency: 'CNH' }
+-+  }
+-+  if (upper.endsWith('.SG')) {
+-+    return { symbol: upper.slice(0, -3), exchange: 'SGX', secType: 'STK', currency: 'SGD' }
+-+  }
+-+
+-+  // Plain symbol — assume US SMART
+-+  return { symbol: upper, exchange: 'SMART', secType: 'STK', currency: 'USD' }
+-+}
+-+
+-+/** Build a fully qualified IBKR Contract from a Longbridge symbol string. */
+-+export function makeContract(lbSymbol: string): Contract {
+-+  const parsed = parseSymbol(lbSymbol)
+-+  const c = new Contract()
+-+  c.symbol = parsed.symbol
+-+  c.exchange = parsed.exchange
+-+  c.secType = parsed.secType
+-+  c.currency = parsed.currency
+-+
+-+  // O(1) lookup for Chinese name: "中文名（代码）"
+-+  const entry = lookupEntry(lbSymbol)
+-+  if (entry) {
+-+    c.description = `${entry.stockNameCn}（${entry.symbol}）`
+-+  }
+-+
+-+  return c
+-+}
+-+
+-+/** Build a fully qualified IBKR Contract from an IBKR-style Contract (passthrough). */
+-+export function makeContractFromContract(contract: Contract): Contract {
+-+  const lbSymbol = resolveSymbol(contract) ?? contract.symbol ?? ''
+-+  return makeContract(lbSymbol)
+-+}
+-+
+-+/** Map Longbridge order status string to IBKR-style OrderState status. */
+-+export function mapOrderStatus(status: string): string {
+-+  switch (status) {
+-+    case 'Filled':
+-+    case 'filled':
+-+      return 'Filled'
+-+    case 'PartialFilled':
+-+    case 'partial_filled':
+-+    case 'PartialFill':
+-+      return 'Submitted'  // still active
+-+    case 'Cancelled':
+-+    case 'canceled':
+-+    case 'cancelled':
+-+      return 'Cancelled'
+-+    case 'Rejected':
+-+    case 'rejected':
+-+      return 'Rejected'
+-+    case 'Expired':
+-+    case 'expired':
+-+      return 'Expired'
+-+    case 'New':
+-+    case 'new':
+-+    case 'Submitted':
+-+    case 'submitted':
+-+      return 'Submitted'
+-+    case 'Pending':
+-+    case 'pending':
+-+      return 'Submitted'
+-+    case 'Inactive':
+-+      return 'Inactive'
+-+    default:
+-+      return 'Submitted'
+-+  }
+-+}
+-+
+-+/** Create an IBKR OrderState from a Longbridge order status string. */
+-+export function makeOrderState(status: string, rejectReason?: string): OrderState {
+-+  const s = new OrderState()
+-+  s.status = mapOrderStatus(status)
+-+  if (rejectReason) s.rejectReason = rejectReason
+-+  return s
+-+}
+-+
+-+/**
+-+ * Static contract registry for Longbridge — seeded with major symbols.
+-+ * This is a fallback for searchContracts() since Longbridge has no search API.
+-+ *
+-+ * Coverage: HK (large-cap), US (major), SG ( Straits Times ),
+-+ * SH/SZ (Shanghai/Shenzhen A-share via Stock Connect).
+-+ *
+-+ * Exported as a plain array for search; also used to build LOOKUP map.
+-+ */
+-+export const STATIC_CONTRACT_REGISTRY: Array<{
+-+  symbol: string
+-+  lbSymbol: string
+-+  secType: string
+-+  exchange: string
+-+  currency: string
+-+  stockName: string
+-+  stockNameCn: string
+-+}> = [
+-+  // Pre-built lookup tables — always in sync with REGISTRY above
+-+  { symbol: '700',   lbSymbol: '700.HK',   secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Tencent Holdings',         stockNameCn: '腾讯控股' },
+-+  { symbol: '9988', lbSymbol: '9988.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Alibaba Group',         stockNameCn: '阿里巴巴' },
+-+  { symbol: '3690', lbSymbol: '3690.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Meituan',               stockNameCn: '美团' },
+-+  { symbol: '9618', lbSymbol: '9618.HK',   secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'JD.com',                stockNameCn: '京东集团' },
+-+  { symbol: '1810', lbSymbol: '1810.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Xiaomi Corporation',   stockNameCn: '小米集团' },
+-+  { symbol: '0941', lbSymbol: '0941.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Mobile',         stockNameCn: '中国移动' },
+-+  { symbol: '2628', lbSymbol: '2628.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Life Insurance', stockNameCn: '中国人寿' },
+-+  { symbol: '1398', lbSymbol: '1398.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'ICBC',                  stockNameCn: '工商银行' },
+-+  { symbol: '3968', lbSymbol: '3968.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Merchants Bank', stockNameCn: '招商银行' },
+-+  { symbol: '3868', lbSymbol: '3868.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Overseas Water', stockNameCn: '中国海外发展' },
+-+  { symbol: '1088', lbSymbol: '1088.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Shenhua Energy', stockNameCn: '中国神华' },
+-+  { symbol: '6633', lbSymbol: '6633.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China Telecom',         stockNameCn: '中国电信' },
+-+  { symbol: '1211', lbSymbol: '1211.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'BYD',                  stockNameCn: '比亚迪' },
+-+  { symbol: '2319', lbSymbol: '2319.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Mengniu Dairy',      stockNameCn: '蒙牛乳业' },
+-+  { symbol: '0011', lbSymbol: '0011.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'HSBC Holdings',       stockNameCn: '汇丰控股' },
+-+  { symbol: '2388', lbSymbol: '2388.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Hang Seng Bank',      stockNameCn: '恒生银行' },
+-+  { symbol: '0001', lbSymbol: '0001.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'CKH Holdings',        stockNameCn: '长和实业' },
+-+  { symbol: '0016', lbSymbol: '0016.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Sun Hung Kai Properties', stockNameCn: '新鸿基地产' },
+-+  { symbol: '0012', lbSymbol: '0012.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Henderson Land',      stockNameCn: '恒基兆业' },
+-+  { symbol: '6060', lbSymbol: '6060.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'ZhongAn Online',      stockNameCn: '众安在线' },
+-+  { symbol: '6030', lbSymbol: '6030.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Citic Securities',    stockNameCn: '中信证券' },
+-+  { symbol: '6837', lbSymbol: '6837.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Huaan Securities',    stockNameCn: '华安证券' },
+-+  { symbol: '3888', lbSymbol: '3888.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'China International Capital', stockNameCn: '中金公司' },
+-+  { symbol: '1772', lbSymbol: '1772.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'Jiangsu Hengrui Medicine', stockNameCn: '恒瑞医药' },
+-+  { symbol: '1515', lbSymbol: '1515.HK',  secType: 'STK', exchange: 'HKEX', currency: 'HKD', stockName: 'CSPC Pharma',          stockNameCn: '石药集团' },
+-+
+-+  // ---- US ----
+-+  { symbol: 'AAPL',  lbSymbol: 'AAPL.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Apple Inc.',             stockNameCn: '苹果' },
+-+  { symbol: 'MSFT',  lbSymbol: 'MSFT.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Microsoft Corporation', stockNameCn: '微软' },
+-+  { symbol: 'NVDA',  lbSymbol: 'NVDA.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'NVIDIA Corporation',  stockNameCn: '英伟达' },
+-+  { symbol: 'GOOGL', lbSymbol: 'GOOGL.US', secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Alphabet Inc. Class A', stockNameCn: '谷歌A' },
+-+  { symbol: 'GOOG',  lbSymbol: 'GOOG.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Alphabet Inc. Class C', stockNameCn: '谷歌C' },
+-+  { symbol: 'AMZN',  lbSymbol: 'AMZN.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Amazon.com Inc.',     stockNameCn: '亚马逊' },
+-+  { symbol: 'META',  lbSymbol: 'META.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Meta Platforms',      stockNameCn: 'Meta' },
+-+  { symbol: 'TSLA',  lbSymbol: 'TSLA.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Tesla Inc.',          stockNameCn: '特斯拉' },
+-+  { symbol: 'BRK.B', lbSymbol: 'BRK.B.US', secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Berkshire Hathaway B', stockNameCn: '伯克希尔B' },
+-+  { symbol: 'JPM',   lbSymbol: 'JPM.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'JPMorgan Chase & Co.', stockNameCn: '摩根大通' },
+-+  { symbol: 'V',     lbSymbol: 'V.US',     secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Visa Inc.',          stockNameCn: 'Visa' },
+-+  { symbol: 'MA',    lbSymbol: 'MA.US',    secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Mastercard Inc.',     stockNameCn: '万事达' },
+-+  { symbol: 'JNJ',   lbSymbol: 'JNJ.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Johnson & Johnson',   stockNameCn: '强生' },
+-+  { symbol: 'WMT',   lbSymbol: 'WMT.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Walmart Inc.',        stockNameCn: '沃尔玛' },
+-+  { symbol: 'PG',    lbSymbol: 'PG.US',    secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Procter & Gamble',   stockNameCn: '宝洁' },
+-+  { symbol: 'UNH',   lbSymbol: 'UNH.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'UnitedHealth Group',  stockNameCn: '联合健康' },
+-+  { symbol: 'HD',    lbSymbol: 'HD.US',    secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Home Depot',          stockNameCn: '家得宝' },
+-+  { symbol: 'BAC',   lbSymbol: 'BAC.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Bank of America',    stockNameCn: '美国银行' },
+-+  { symbol: 'XOM',   lbSymbol: 'XOM.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Exxon Mobil',        stockNameCn: '埃克森美孚' },
+-+  { symbol: 'DIS',   lbSymbol: 'DIS.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Walt Disney',        stockNameCn: '迪士尼' },
+-+  { symbol: 'NFLX',  lbSymbol: 'NFLX.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Netflix Inc.',       stockNameCn: '奈飞' },
+-+  { symbol: 'INTC',  lbSymbol: 'INTC.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Intel Corporation',  stockNameCn: '英特尔' },
+-+  { symbol: 'AMD',   lbSymbol: 'AMD.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Advanced Micro Devices', stockNameCn: '超微半导体' },
+-+  { symbol: 'PYPL',  lbSymbol: 'PYPL.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'PayPal Holdings',    stockNameCn: 'PayPal' },
+-+  { symbol: 'CRM',   lbSymbol: 'CRM.US',   secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Salesforce Inc.',    stockNameCn: 'Salesforce' },
+-+  { symbol: 'UBER',  lbSymbol: 'UBER.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Uber Technologies',   stockNameCn: 'Uber' },
+-+  { symbol: 'COIN',  lbSymbol: 'COIN.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Coinbase Global',     stockNameCn: 'Coinbase' },
+-+  { symbol: 'SQ',    lbSymbol: 'SQ.US',    secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Block Inc.',         stockNameCn: 'Block' },
+-+  { symbol: 'SHOP',  lbSymbol: 'SHOP.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Shopify Inc.',       stockNameCn: 'Shopify' },
+-+  { symbol: 'SPXL',  lbSymbol: 'SPXL.US',  secType: 'STK', exchange: 'SMART', currency: 'USD', stockName: 'Direxion Daily S&P500 3x', stockNameCn: '3倍做多S&P500' },
+-+
+-+  // ---- Shanghai Stock Connect ----
+-+  { symbol: '600000', lbSymbol: 'SH.600000', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Shanghai Pudong Dev Bank', stockNameCn: '浦发银行' },
+-+  { symbol: '600519', lbSymbol: 'SH.600519', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Kweichow Moutai',     stockNameCn: '贵州茅台' },
+-+  { symbol: '600036', lbSymbol: 'SH.600036', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'China Merchants Bank', stockNameCn: '招商银行' },
+-+  { symbol: '601012', lbSymbol: 'SH.601012', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: '隆基绿能 LONGi Green Energy', stockNameCn: '隆基绿能' },
+-+  { symbol: '601318', lbSymbol: 'SH.601318', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Ping An Insurance',    stockNameCn: '中国平安' },
+-+  { symbol: '601398', lbSymbol: 'SH.601398', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Industrial and Commercial Bank of China', stockNameCn: '工商银行' },
+-+  { symbol: '600276', lbSymbol: 'SH.600276', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Jiangsu Hengrui Medicine', stockNameCn: '恒瑞医药' },
+-+  { symbol: '600030', lbSymbol: 'SH.600030', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Citic Securities',    stockNameCn: '中信证券' },
+-+  { symbol: '600887', lbSymbol: 'SH.600887', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Inner Mongolia Yili', stockNameCn: '伊利股份' },
+-+  { symbol: '600009', lbSymbol: 'SH.600009', secType: 'STK', exchange: 'SH', currency: 'CNH', stockName: 'Shanghai International Airport', stockNameCn: '上海机场' },
+-+
+-+  // ---- Shenzhen Stock Connect ----
+-+  { symbol: '000001', lbSymbol: 'SZ.000001', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'Ping An Bank',         stockNameCn: '平安银行' },
+-+  { symbol: '000002', lbSymbol: 'SZ.000002', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'China Vanke',        stockNameCn: '万科A' },
+-+  { symbol: '000063', lbSymbol: 'SZ.000063', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'ZTE Corporation',    stockNameCn: '中兴通讯' },
+-+  { symbol: '000333', lbSymbol: 'SZ.000333', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'Midea Group',         stockNameCn: '美的集团' },
+-+  { symbol: '000858', lbSymbol: 'SZ.000858', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'Wuliangye Yibin',    stockNameCn: '五粮液' },
+-+  { symbol: '000876', lbSymbol: 'SZ.000876', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'New Hope Liuhe',     stockNameCn: '新希望' },
+-+  { symbol: '002594', lbSymbol: 'SZ.002594', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'BYD',                 stockNameCn: '比亚迪' },
+-+  { symbol: '002415', lbSymbol: 'SZ.002415', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'Hikvision',          stockNameCn: '海康威视' },
+-+  { symbol: '002475', lbSymbol: 'SZ.002475', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'Luxshare Precision', stockNameCn: '立讯精密' },
+-+  { symbol: '300750', lbSymbol: 'SZ.300750', secType: 'STK', exchange: 'SZ', currency: 'CNH', stockName: 'CATL (Contemporary Amperex Technology)', stockNameCn: '宁德时代' },
+-+
+-+  // ---- Singapore ----
+-+  { symbol: 'STI',    lbSymbol: 'STI.SG',    secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'Straits Times Index ETF', stockNameCn: '海峡时报指数' },
+-+  { symbol: 'D05',   lbSymbol: 'D05.SG',   secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'DBS Group Holdings', stockNameCn: '星展集团' },
+-+  { symbol: 'O39',   lbSymbol: 'O39.SG',   secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'OCBC Bank',           stockNameCn: '华侨银行' },
+-+  { symbol: 'U11',   lbSymbol: 'U11.SG',   secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'United Overseas Bank', stockNameCn: '大华银行' },
+-+  { symbol: 'C6L',   lbSymbol: 'C6L.SG',   secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'Singapore Airlines',  stockNameCn: '新加坡航空' },
+-+  { symbol: 'Z74',   lbSymbol: 'Z74.SG',   secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'SATS Ltd',            stockNameCn: 'SATS' },
+-+  { symbol: 'ME8U',  lbSymbol: 'ME8U.SG',  secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'Mapletree Pan Asia Commercial Trust', stockNameCn: '凯德商用房产信托' },
+-+  { symbol: 'BUOU',  lbSymbol: 'BUOU.SG',  secType: 'STK', exchange: 'SGX', currency: 'SGD', stockName: 'Mapletree Oakwood REIT', stockNameCn: '凯德乌节路信托' },
+-+]
+-+
+-+/** O(1) lookup map built once from REGISTRY. */
+-+export const REGISTRY_LOOKUP = new Map<string, typeof STATIC_CONTRACT_REGISTRY[number]>(
+-+  STATIC_CONTRACT_REGISTRY.map(e => [e.lbSymbol.toUpperCase(), e]),
+-+)
+-+
+-+/**
+-+ * O(1) lookup for a registry entry by lbSymbol.
+-+ * Returns undefined if not found (caller decides fallback).
+-+ */
+-+export function lookupEntry(lbSymbol: string): typeof STATIC_CONTRACT_REGISTRY[number] | undefined {
+-+  return REGISTRY_LOOKUP.get(lbSymbol.toUpperCase())
+-+}
+-diff --git a/src/domain/trading/brokers/longbridge/longbridge-types.ts b/src/domain/trading/brokers/longbridge/longbridge-types.ts
+-new file mode 100644
+-index 0000000..9c766df
+---- /dev/null
+-+++ b/src/domain/trading/brokers/longbridge/longbridge-types.ts
+-@@ -0,0 +1,205 @@
+-+/**
+-+ * Longbridge SDK type definitions and raw API shapes.
+-+ *
+-+ * Matches the official `longbridge` npm package (NAPI-RS, Node.js 18+).
+-+ * Import Config, TradeContext, QuoteContext, Decimal, Market from 'longbridge'.
+-+ */
+-+
+-+import type {
+-+  Config,
+-+  TradeContext,
+-+  QuoteContext,
+-+  Market,
+-+  SecurityBoard,
+-+  OrderType,
+-+  OrderSide,
+-+  OrderStatus,
+-+  TimeInForceType,
+-+  Decimal,
+-+  SubmitOrderOptions,
+-+  AccountBalance,
+-+  StockPosition,
+-+  Order,
+-+  Execution,
+-+} from 'longbridge'
+-+
+-+export type {
+-+  Config,
+-+  TradeContext,
+-+  QuoteContext,
+-+  Market,
+-+  SecurityBoard,
+-+  OrderType,
+-+  OrderSide,
+-+  OrderStatus,
+-+  TimeInForceType,
+-+  Decimal,
+-+  SubmitOrderOptions,
+-+  AccountBalance,
+-+  StockPosition,
+-+  Order as LbOrder,
+-+  Execution,
+-+}
+-+
+-+export {
+-+  // Market enum values
+-+  Market as LbMarket,
+-+  // SecurityBoard enum values
+-+  SecurityBoard as LbSecurityBoard,
+-+  // OrderType
+-+  OrderType as LbOrderType,
+-+  // OrderSide
+-+  OrderSide as LbOrderSide,
+-+  // OrderStatus
+-+  OrderStatus as LbOrderStatus,
+-+  // TimeInForceType
+-+  TimeInForceType as LbTimeInForceType,
+-+  // Config static methods
+-+} from 'longbridge'
+-+
+-+// ==================== Config shapes ====================
+-+
+-+export interface LbConfigOptions {
+-+  appKey?: string
+-+  appSecret?: string
+-+  accessToken?: string
+-+  environment?: 'test' | 'live'
+-+}
+-+
+-+// ==================== Raw API shapes ====================
+-+
+-+/** AccountBalance.cashList[].currency */
+-+export type LbCurrency = 'HKD' | 'USD' | 'CNH' | 'RMB' | 'SGD' | 'HKDC' | 'USDC'
+-+
+-+export interface LbAccountBalanceRaw {
+-+  baseCurrency: LbCurrency
+-+  cash: string
+-+  frozenCash: string
+-+  /** Cash available for trading */
+-+  availableCash: string
+-+  /** Account net value */
+-+  netAssets: string
+-+  /** Market value of positions */
+-+  marketValue: string
+-+  currency: LbCurrency
+-+}
+-+
+-+export interface LbPositionRaw {
+-+  symbol: string
+-+  stockName: string
+-+  /** Number of shares */
+-+  quantity: number
+-+  /** Shares available to sell */
+-+  availableQuantity: number
+-+  /** Average cost per share */
+-+  averageCost: number
+-+  /** Latest market price */
+-+  lastPrice: number
+-+  /** Market value */
+-+  marketValue: number
+-+  /** Unrealized profit/loss */
+-+  unrealizedPnl: number
+-+  /** Realized profit/loss */
+-+  realizedPnl: number
+-+  /** Currency */
+-+  currency: LbCurrency
+-+  /** Position side */
+-+  side: 'Long' | 'Short'
+-+}
+-+
+-+export interface LbOrderRaw {
+-+  orderId: string
+-+  orderIdStr: string
+-+  status: string
+-+  stockName: string
+-+  submittedEdt: string
+-+  submittedAt: string
+-+  expiredAt?: string
+-+  side: string
+-+  orderType: string
+-+  lastPrice: number
+-+  triggerPrice?: number
+-+  submittedPrice?: number
+-+  playedPrice?: number
+-+  playedAt?: string
+-+  securitiesAccountId?: string
+-+  segmentName?: string
+-+  totalQuantity: number
+-+  filledQuantity: number
+-+  averagePrice: number
+-+  currency: LbCurrency
+-+  comment?: string
+-+  timeInForce: string
+-+  /** For trailing orders */
+-+  trailingAmount?: number
+-+  /** For trailing percent orders */
+-+  trailingPercent?: number
+-+  /** For TSLP (trailing stop limit) */
+-+  limitOffset?: number
+-+  /** For stop orders */
+-+  triggerAt?: string
+-+  /** Outside regular trading hours */
+-+  outsideRth?: boolean
+-+  /** Take profit price */
+-+  takeProfitPrice?: number
+-+  /** Stop loss price */
+-+  stopLossPrice?: number
+-+}
+-+
+-+export interface LbExecutionRaw {
+-+  executionId: string
+-+  orderId: string
+-+  orderIdStr: string
+-+  symbol: string
+-+  stockName: string
+-+  side: string
+-+  executionPrice: number
+-+  executionQuantity: number
+-+  executionVolume: number
+-+  timestamp: string
+-+  currency: LbCurrency
+-+  transactionId?: string
+-+}
+-+
+-+export interface LbQuoteRaw {
+-+  symbol: string
+-+  lastPrice: number
+-+  lastClose: number
+-+  open: number
+-+  high: number
+-+  low: number
+-+  volume: number
+-+  timestamp: number
+-+  bidPriceList: number[]
+-+  askPriceList: number[]
+-+  bidVolumeList: number[]
+-+  askVolumeList: number[]
+-+}
+-+
+-+export interface LbTradingSessionRaw {
+-+  /** Unix timestamp ms */
+-+  tradingSessionId: number
+-+  /** 1=pre-market, 2=day, 3=after-hours, 4=closed */
+-+  sessionType: number
+-+  /** ISO timestamp */
+-+  startAt: string
+-+  /** ISO timestamp */
+-+  endAt: string
+-+}
+-+
+-+export interface LbMarketTradingSessionRaw {
+-+  market: number
+-+  sessions: LbTradingSessionRaw[]
+-+}
+-+
+-+// ==================== Config schema ====================
+-+
+-+export interface LongbridgeBrokerConfig {
+-+  id?: string
+-+  label?: string
+-+  appKey?: string
+-+  appSecret?: string
+-+  accessToken?: string
+-+  /** Enable live trading (default: false = paper/test) */
+-+  live?: boolean
+-+}
+-diff --git a/src/domain/trading/brokers/registry.ts b/src/domain/trading/brokers/registry.ts
+-index b640ea2..d0b8826 100644
+---- a/src/domain/trading/brokers/registry.ts
+-+++ b/src/domain/trading/brokers/registry.ts
+-@@ -11,6 +11,7 @@ import type { AccountConfig } from '../../../core/config.js'
+- import { CcxtBroker } from './ccxt/CcxtBroker.js'
+- import { AlpacaBroker } from './alpaca/AlpacaBroker.js'
+- import { IbkrBroker } from './ibkr/IbkrBroker.js'
+-+import { LongbridgeBroker } from './longbridge/index.js'
+- 
+- // ==================== Subtitle field descriptor ====================
+- 
+-@@ -113,4 +114,27 @@ Before connecting:
+- 
+- Paper trading requires a separate paper account login in TWS.`,
+-   },
+-+  longbridge: {
+-+    configSchema: LongbridgeBroker.configSchema,
+-+    configFields: LongbridgeBroker.configFields,
+-+    fromConfig: LongbridgeBroker.fromConfig,
+-+    name: 'Longbridge (长桥证券)',
+-+    description: 'Commission-free trading for HK, US, Shanghai A, Shenzhen A, and Singapore equities. No local terminal required.',
+-+    badge: 'LB',
+-+    badgeColor: 'text-blue-400',
+-+    subtitleFields: [
+-+      { field: 'live', label: 'Live Trading', falseLabel: 'Paper/Test' },
+-+    ],
+-+    guardCategory: 'securities',
+-+    setupGuide: `Longbridge (长桥证券) is a global brokerage offering commission-free trading across Hong Kong, US, Shanghai/Shenzhen A-shares (via Stock Connect), and Singapore markets.
+-+
+-+Before connecting:
+-+1. Open an account at app.longbridge.global and complete identity verification
+-+2. Create an API application in Settings → API → Create App — you will receive an App Key, App Secret, and Access Token
+-+3. Grant trading permissions to the API key (read + trade, no withdrawal)
+-+
+-+The Access Token is a long-lived OAuth bearer token. Treat it like a password — never commit it to source control.
+-+
+-+You can toggle "Live Trading" to route orders to the live or test environment. Use the test environment to validate your setup before placing real orders.`,
+-+  },
+- }
+-diff --git a/ui/src/api/types.ts b/ui/src/api/types.ts
+-index 61f7fa2..927361a 100644
+---- a/ui/src/api/types.ts
+-+++ b/ui/src/api/types.ts
+-@@ -241,6 +241,7 @@ export interface Position {
+-     right?: string
+-     multiplier?: number
+-     localSymbol?: string
+-+    description?: string
+-   }
+-   /** Currency denomination of all monetary fields. */
+-   currency: string
+-diff --git a/ui/src/pages/PortfolioPage.tsx b/ui/src/pages/PortfolioPage.tsx
+-index f86671f..daf694d 100644
+---- a/ui/src/pages/PortfolioPage.tsx
+-+++ b/ui/src/pages/PortfolioPage.tsx
+-@@ -372,8 +372,8 @@ function contractDisplay(p: Position): { name: string; tag?: string } {
+-   if (t === 'CRYPTO') {
+-     return { name: sym, tag: 'spot' }
+-   }
+--  // STK, CASH, BOND, CMDTY, etc. — just the symbol, no tag
+--  return { name: sym }
+-+  // STK, CASH, BOND, CMDTY, etc. — use description if set (e.g. "京东（JD）"), else symbol
+-+  return { name: c.description || sym }
+- }
+- 
+- function PositionsTable({ positions, fxRates }: { positions: PositionWithAccount[]; fxRates: FxRateInfo[] }) {
 diff --git a/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts b/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts
 new file mode 100644
-index 0000000..576fb3e
+index 0000000..075a794
 --- /dev/null
 +++ b/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts
-@@ -0,0 +1,638 @@
+@@ -0,0 +1,644 @@
 +/**
 + * LongbridgeBroker — IBroker adapter for Longbridge (长桥证券)
 + *
@@ -559,23 +1806,29 @@ index 0000000..576fb3e
 +      const sessions = await this.quoteCtx.tradingSession()
 +      const nowMs = Date.now()
 +
++      // HKT = UTC+8
++      const HKT_OFFSET_MS = 8 * 3600000
++      const hktDate = new Date(nowMs + HKT_OFFSET_MS)
++      const hktYear  = hktDate.getUTCFullYear()
++      const hktMonth = hktDate.getUTCMonth()
++      const hktDay   = hktDate.getUTCDate()
++      // HKT midnight on date D = UTC 16:00 on date D-1
++      const hktMidnightMs = Date.UTC(hktYear, hktMonth, hktDay) - HKT_OFFSET_MS
++
 +      for (const mts of sessions) {
 +        for (const s of mts.tradeSessions) {
-+          // TradingSessionInfo.beginTime / endTime are NAPI-RS Time objects
-+          // Time has .toString() returning "HH:mm:ss" — reconstruct as today's datetime
-+          const today = new Date().toISOString().split('T')[0]
-+          const beginMs = new Date(`${today}T${s.beginTime}`).getTime()
-+          const endMs   = new Date(`${today}T${s.endTime}`).getTime()
++          // Extract primitive values from NAPI-RS Time getters
++          const bh = s.beginTime.hour   ?? 0, bm = s.beginTime.minute ?? 0, bs = s.beginTime.second ?? 0
++          const eh = s.endTime.hour     ?? 0, em = s.endTime.minute   ?? 0, es = s.endTime.second   ?? 0
++          const beginMs = hktMidnightMs + bh * 3600000 + bm * 60000 + bs * 1000
++          const endMs   = hktMidnightMs + eh * 3600000 + em * 60000 + es * 1000
 +          if (nowMs >= beginMs && nowMs <= endMs) {
-+            // 0 = Intraday = main session = market open
 +            return { isOpen: s.tradeSession === 0, timestamp: new Date() }
 +          }
 +        }
 +      }
 +      return { isOpen: false, timestamp: new Date() }
 +    } catch (err) {
-+      // Defensive: assume market closed on error to avoid accidentally placing
-+      // orders during an API outage or weekend / holiday.
 +      console.warn(`LongbridgeBroker[${this.id}].getMarketClock failed:`, err)
 +      return { isOpen: false, timestamp: new Date() }
 +    }
@@ -1197,70 +2450,3 @@ index 0000000..9c766df
 +  /** Enable live trading (default: false = paper/test) */
 +  live?: boolean
 +}
-diff --git a/src/domain/trading/brokers/registry.ts b/src/domain/trading/brokers/registry.ts
-index b640ea2..d0b8826 100644
---- a/src/domain/trading/brokers/registry.ts
-+++ b/src/domain/trading/brokers/registry.ts
-@@ -11,6 +11,7 @@ import type { AccountConfig } from '../../../core/config.js'
- import { CcxtBroker } from './ccxt/CcxtBroker.js'
- import { AlpacaBroker } from './alpaca/AlpacaBroker.js'
- import { IbkrBroker } from './ibkr/IbkrBroker.js'
-+import { LongbridgeBroker } from './longbridge/index.js'
- 
- // ==================== Subtitle field descriptor ====================
- 
-@@ -113,4 +114,27 @@ Before connecting:
- 
- Paper trading requires a separate paper account login in TWS.`,
-   },
-+  longbridge: {
-+    configSchema: LongbridgeBroker.configSchema,
-+    configFields: LongbridgeBroker.configFields,
-+    fromConfig: LongbridgeBroker.fromConfig,
-+    name: 'Longbridge (长桥证券)',
-+    description: 'Commission-free trading for HK, US, Shanghai A, Shenzhen A, and Singapore equities. No local terminal required.',
-+    badge: 'LB',
-+    badgeColor: 'text-blue-400',
-+    subtitleFields: [
-+      { field: 'live', label: 'Live Trading', falseLabel: 'Paper/Test' },
-+    ],
-+    guardCategory: 'securities',
-+    setupGuide: `Longbridge (长桥证券) is a global brokerage offering commission-free trading across Hong Kong, US, Shanghai/Shenzhen A-shares (via Stock Connect), and Singapore markets.
-+
-+Before connecting:
-+1. Open an account at app.longbridge.global and complete identity verification
-+2. Create an API application in Settings → API → Create App — you will receive an App Key, App Secret, and Access Token
-+3. Grant trading permissions to the API key (read + trade, no withdrawal)
-+
-+The Access Token is a long-lived OAuth bearer token. Treat it like a password — never commit it to source control.
-+
-+You can toggle "Live Trading" to route orders to the live or test environment. Use the test environment to validate your setup before placing real orders.`,
-+  },
- }
-diff --git a/ui/src/api/types.ts b/ui/src/api/types.ts
-index 61f7fa2..927361a 100644
---- a/ui/src/api/types.ts
-+++ b/ui/src/api/types.ts
-@@ -241,6 +241,7 @@ export interface Position {
-     right?: string
-     multiplier?: number
-     localSymbol?: string
-+    description?: string
-   }
-   /** Currency denomination of all monetary fields. */
-   currency: string
-diff --git a/ui/src/pages/PortfolioPage.tsx b/ui/src/pages/PortfolioPage.tsx
-index f86671f..daf694d 100644
---- a/ui/src/pages/PortfolioPage.tsx
-+++ b/ui/src/pages/PortfolioPage.tsx
-@@ -372,8 +372,8 @@ function contractDisplay(p: Position): { name: string; tag?: string } {
-   if (t === 'CRYPTO') {
-     return { name: sym, tag: 'spot' }
-   }
--  // STK, CASH, BOND, CMDTY, etc. — just the symbol, no tag
--  return { name: sym }
-+  // STK, CASH, BOND, CMDTY, etc. — use description if set (e.g. "京东（JD）"), else symbol
-+  return { name: c.description || sym }
- }
- 
- function PositionsTable({ positions, fxRates }: { positions: PositionWithAccount[]; fxRates: FxRateInfo[] }) {
