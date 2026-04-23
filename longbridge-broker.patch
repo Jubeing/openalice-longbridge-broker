@@ -1,9 +1,9 @@
 diff --git a/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts b/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts
 new file mode 100644
-index 0000000..43f6915
+index 0000000..c261fa3
 --- /dev/null
 +++ b/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts
-@@ -0,0 +1,640 @@
+@@ -0,0 +1,638 @@
 +/**
 + * LongbridgeBroker — IBroker adapter for Longbridge (长桥证券)
 + *
@@ -28,7 +28,6 @@ index 0000000..43f6915
 +  ContractDetails,
 +  Order,
 +  UNSET_DOUBLE,
-+  UNSET_DECIMAL,
 +} from '@traderalice/ibkr'
 +import {
 +  BrokerError,
@@ -60,7 +59,6 @@ index 0000000..43f6915
 +import {
 +  resolveSymbol,
 +  makeContract,
-+  mapOrderStatus,
 +  makeOrderState,
 +  lookupEntry,
 +  STATIC_CONTRACT_REGISTRY,
