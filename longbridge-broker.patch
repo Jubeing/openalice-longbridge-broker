@@ -1,33 +1,9 @@
-diff --git a/package.json b/package.json
-index c590852..af33134 100644
---- a/package.json
-+++ b/package.json
-@@ -46,6 +46,7 @@
-     "ccxt": "^4.5.38",
-     "chalk": "^5.6.2",
-     "decimal.js": "^10.6.0",
-+    "longbridge": "^4.0.5",
-     "express": "^5.2.1",
-     "file-type": "^21.3.2",
-     "grammy": "^1.40.0",
-diff --git a/src/domain/trading/brokers/index.ts b/src/domain/trading/brokers/index.ts
-index dfb210d..7665fd0 100644
---- a/src/domain/trading/brokers/index.ts
-+++ b/src/domain/trading/brokers/index.ts
-@@ -29,3 +29,7 @@ export type { CcxtBrokerConfig } from './ccxt/index.js'
- // IBKR
- export { IbkrBroker } from './ibkr/index.js'
- export type { IbkrBrokerConfig } from './ibkr/index.js'
-+
-+// Longbridge
-+export { LongbridgeBroker } from './longbridge/index.js'
-+export type { LongbridgeBrokerConfig } from './longbridge/index.js'
 diff --git a/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts b/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts
 new file mode 100644
-index 0000000..576fb3e
+index 0000000..43f6915
 --- /dev/null
 +++ b/src/domain/trading/brokers/longbridge/LongbridgeBroker.ts
-@@ -0,0 +1,638 @@
+@@ -0,0 +1,640 @@
 +/**
 + * LongbridgeBroker — IBroker adapter for Longbridge (长桥证券)
 + *
@@ -87,6 +63,7 @@ index 0000000..576fb3e
 +  mapOrderStatus,
 +  makeOrderState,
 +  lookupEntry,
++  STATIC_CONTRACT_REGISTRY,
 +} from './longbridge-contracts.js'
 +
 +import type { LongbridgeBrokerConfig } from './longbridge-types.js'
@@ -326,24 +303,25 @@ index 0000000..576fb3e
 +        timeInForce: ibkrTifToLb(order.tif ?? 'DAY'),
 +      }
 +
-+      if (!order.totalQuantity.equals(UNSET_DECIMAL)) {
-+        opts.submittedQuantity = new LbDecimal(order.totalQuantity.toString())
-+      } else if (order.cashQty !== UNSET_DOUBLE) {
-+        opts.submittedQuantity = new LbDecimal(order.cashQty)
++      const qty = order.totalQuantity
++      if (!qty.isZero()) {
++        opts.submittedQuantity = new LbDecimal(qty.toString())
++      } else if (Number(order.cashQty) !== UNSET_DOUBLE) {
++        opts.submittedQuantity = new LbDecimal(order.cashQty.toString())
 +      }
 +
-+      if (order.lmtPrice !== UNSET_DOUBLE) {
-+        opts.submittedPrice = new LbDecimal(order.lmtPrice)
++      if (Number(order.lmtPrice) !== UNSET_DOUBLE) {
++        opts.submittedPrice = new LbDecimal(order.lmtPrice.toString())
 +      }
-+      if (order.auxPrice !== UNSET_DOUBLE) {
++      if (Number(order.auxPrice) !== UNSET_DOUBLE) {
 +        if (order.orderType === 'TRAIL') {
-+          opts.trailingAmount = new LbDecimal(order.auxPrice)
++          opts.trailingAmount = new LbDecimal(order.auxPrice.toString())
 +        } else {
-+          opts.triggerPrice = new LbDecimal(order.auxPrice)
++          opts.triggerPrice = new LbDecimal(order.auxPrice.toString())
 +        }
 +      }
-+      if (order.trailingPercent !== UNSET_DOUBLE) {
-+        opts.trailingPercent = new LbDecimal(order.trailingPercent)
++      if (Number(order.trailingPercent) !== UNSET_DOUBLE) {
++        opts.trailingPercent = new LbDecimal(order.trailingPercent.toString())
 +      }
 +      if (order.outsideRth) {
 +        opts.outsideRth = 2  // AnyTime
@@ -373,17 +351,17 @@ index 0000000..576fb3e
 +  async modifyOrder(orderId: string, changes: Partial<Order>): Promise<PlaceOrderResult> {
 +    try {
 +      const opts: Record<string, unknown> = { orderId }
-+      if (changes.totalQuantity != null && !changes.totalQuantity.equals(UNSET_DECIMAL)) {
++      if (changes.totalQuantity != null && !changes.totalQuantity.isZero()) {
 +        opts.quantity = new LbDecimal(changes.totalQuantity.toString())
 +      }
-+      if (changes.lmtPrice != null && changes.lmtPrice !== UNSET_DOUBLE) {
-+        opts.price = new LbDecimal(changes.lmtPrice)
++      if (changes.lmtPrice != null && Number(changes.lmtPrice) !== UNSET_DOUBLE) {
++        opts.price = new LbDecimal(changes.lmtPrice.toString())
 +      }
-+      if (changes.auxPrice != null && changes.auxPrice !== UNSET_DOUBLE) {
-+        opts.triggerPrice = new LbDecimal(changes.auxPrice)
++      if (changes.auxPrice != null && Number(changes.auxPrice) !== UNSET_DOUBLE) {
++        opts.triggerPrice = new LbDecimal(changes.auxPrice.toString())
 +      }
-+      if (changes.trailingPercent != null && changes.trailingPercent !== UNSET_DOUBLE) {
-+        opts.trailingPercent = new LbDecimal(changes.trailingPercent)
++      if (changes.trailingPercent != null && Number(changes.trailingPercent) !== UNSET_DOUBLE) {
++        opts.trailingPercent = new LbDecimal(changes.trailingPercent.toString())
 +      }
 +      await this.tradeCtx.replaceOrder(opts as never)
 +      return { success: true, orderId, message: `Order ${orderId} replaced` }
@@ -652,8 +630,8 @@ index 0000000..576fb3e
 +    order.action         = o.side === LbOrderSide.Buy ? 'BUY' : 'SELL'
 +    order.totalQuantity  = new Decimal(o.quantity.toString())
 +    order.orderType      = String(o.orderType)
-+    if (o.price)         order.lmtPrice = lbToNumber(o.price)
-+    if (o.triggerPrice)  order.auxPrice = lbToNumber(o.triggerPrice)
++    if (o.price)         order.lmtPrice = new Decimal(Number(o.price))
++    if (o.triggerPrice)  order.auxPrice = new Decimal(Number(o.triggerPrice))
 +    if (o.timeInForce)   order.tif = String(o.timeInForce)
 +    if (o.outsideRth != null) order.outsideRth = o.outsideRth === 2
 +    order.orderId = 0   // numeric IBKR convention; string ID in orderId field
@@ -1197,6 +1175,30 @@ index 0000000..9c766df
 +  /** Enable live trading (default: false = paper/test) */
 +  live?: boolean
 +}
+diff --git a/package.json b/package.json
+index 3f8d4cc..d0b302e 100644
+--- a/package.json
++++ b/package.json
+@@ -46,6 +46,7 @@
+     "ccxt": "^4.5.38",
+     "chalk": "^5.6.2",
+     "decimal.js": "^10.6.0",
++    "longbridge": "^4.0.5",
+     "express": "^5.2.1",
+     "file-type": "^21.3.2",
+     "grammy": "^1.40.0",
+diff --git a/src/domain/trading/brokers/index.ts b/src/domain/trading/brokers/index.ts
+index dfb210d..7665fd0 100644
+--- a/src/domain/trading/brokers/index.ts
++++ b/src/domain/trading/brokers/index.ts
+@@ -29,3 +29,7 @@ export type { CcxtBrokerConfig } from './ccxt/index.js'
+ // IBKR
+ export { IbkrBroker } from './ibkr/index.js'
+ export type { IbkrBrokerConfig } from './ibkr/index.js'
++
++// Longbridge
++export { LongbridgeBroker } from './longbridge/index.js'
++export type { LongbridgeBrokerConfig } from './longbridge/index.js'
 diff --git a/src/domain/trading/brokers/registry.ts b/src/domain/trading/brokers/registry.ts
 index b640ea2..d0b8826 100644
 --- a/src/domain/trading/brokers/registry.ts
@@ -1238,10 +1240,10 @@ index b640ea2..d0b8826 100644
 +  },
  }
 diff --git a/ui/src/api/types.ts b/ui/src/api/types.ts
-index 61f7fa2..927361a 100644
+index d5683fe..1ffd15b 100644
 --- a/ui/src/api/types.ts
 +++ b/ui/src/api/types.ts
-@@ -241,6 +241,7 @@ export interface Position {
+@@ -273,6 +273,7 @@ export interface Position {
      right?: string
      multiplier?: number
      localSymbol?: string
